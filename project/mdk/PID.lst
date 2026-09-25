@@ -1,0 +1,285 @@
+C251 COMPILER V5.60.0,  PID                                                                21/09/26  22:45:17  PAGE 1   
+
+
+C251 COMPILER V5.60.0, COMPILATION OF MODULE PID
+OBJECT MODULE PLACED IN .\PID.obj
+COMPILER INVOKED BY: D:\APP\DEV\KEIL5\C251\BIN\C251.EXE ..\code\PID.c LARGE INTR2 BROWSE INCDIR(..\..\libraries\zf_commo
+                    -n;..\..\libraries\zf_device;..\..\libraries\zf_driver;..\code;..\mdk;..\user;..\..\libraries\zf_components\seekfree_assi
+                    -stant;..\..\libraries\zf_components\stc32g_usb_lib) DEBUG PRINT(.\PID.lst) OBJECT(.\PID.obj) 
+
+stmt  level    source
+
+    1          /**
+    2           * @file    PID.c
+    3           * @brief   PID控制模块：舵机位置式PID(前馈融合+陀螺仪阻尼+曲率前馈) + 电机增�
+             -�式PID
+    4           * @author  RRZ
+    5           * @date    2026-05-16
+    6           */
+    7          
+    8          #include "PID.h"
+    9          #include "sevro.h"
+   10          #include "image.h"
+   11          
+   12          volatile uint16 Out_servo = SERVO_DUTY_MID;   // 舵机PWM输出值（全局）
+   13          float g_steer_err = 0.0f;                      // 转向误差（全局，供调试/VOFA显示）
+   14          
+   15          extern int16 g_target_col;
+   16          
+   17          #define DEFAULT_SERVO_KP     9.5f    // 舵机比例系数：越大转向越灵敏，太大直道会抖
+   18          #define DEFAULT_SERVO_KG     0.01f   // 陀螺仪阻尼系数：越大越抑制过冲，太大会迟钝
+   19          #define DEFAULT_SERVO_KP2    0.024f  // 舵机二次项系数：大弯时额外加力
+   20          
+   21          #define DEFAULT_MOTOR_KP     22.0f   // 电机比例系数：速度响应快慢
+   22          #define DEFAULT_MOTOR_KI     3.0f    // 电机积分系数：消除稳态误差
+   23          #define DEFAULT_MOTOR_KD     3.0f    // 电机微分系数：抑制超调
+   24          
+   25          // 右电机PID实例
+   26          volatile PID_tf pid_rf = {
+   27              DEFAULT_MOTOR_KP, DEFAULT_MOTOR_KI, DEFAULT_MOTOR_KD,
+   28              0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+   29          };
+   30          
+   31          // 左电机PID实例
+   32          volatile PID_tf pid_lf = {
+   33              DEFAULT_MOTOR_KP, DEFAULT_MOTOR_KI, DEFAULT_MOTOR_KD,
+   34              0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+   35          };
+   36          
+   37          // 舵机PID实例：kp/kp2/kg 已赋值，ki/kd=0（舵机用位置式，不需要积分/微分）
+   38          volatile PID_tf servo_pidf = {
+   39              DEFAULT_SERVO_KP,
+   40              0.0f,        // ki=0，位置式P控制
+   41              0.0f,        // kd=0
+   42              DEFAULT_SERVO_KG,
+   43              DEFAULT_SERVO_KP2,
+   44              0.0f, 0.0f, 0.0f, 0.0f
+   45          };
+   46          
+   47          /**
+   48           * @brief  浮点数限幅
+   49           */
+   50          float limit_float(float x, float min, float max)
+   51          {
+   52   1          if (x > max) return max;
+   53   1          if (x < min) return min;
+   54   1          return x;
+   55   1      }
+   56          
+C251 COMPILER V5.60.0,  PID                                                                21/09/26  22:45:17  PAGE 2   
+
+   57          /**
+   58           * @brief  增量式PID：delta = kp*d_err + ki*error + kd*dd_err，用于电机速度闭环
+   59           * @param  pid      PID结构体指针
+   60           * @param  tar_val  目标值
+   61           * @param  act_val  实际值
+   62           * @retval 无 (更新 pid->out)
+   63           */
+   64          void Increment_PIDf(volatile PID_tf *pid, float tar_val, float act_val)
+   65          {
+   66   1          float error, d_err, dd_err, delta, new_out;
+   67   1      
+   68   1          // 计算当前误差及一阶/二阶差分
+   69   1          error  = tar_val - act_val;                         // 当前误差
+   70   1          d_err  = error - pid->err1;                         // 一阶差分（误差变化量）
+   71   1          dd_err = error - 2 * pid->err1 + pid->err2;         // 二阶差分（误差变化加速度）
+   72   1      
+   73   1          // 增量式PID：delta = Kp * d_err + Ki * error + Kd * dd_err
+   74   1          delta  = pid->kp * d_err;                           // 比例项：响应速度变化
+   75   1          delta += pid->ki * error;                           // 积分项：消除稳态误差
+   76   1          delta += pid->kd * dd_err;                          // 微分项：抑制超调
+   77   1      
+   78   1          // 累加增量 → 绝对值输出
+   79   1          new_out = pid->out + delta;
+   80   1      
+   81   1          // 输出限幅保护
+   82   1          pid->out = limit_float(new_out, OUT_MIN, OUT_MAX);
+   83   1      
+   84   1          // 更新误差历史
+   85   1          pid->err2 = pid->err1;   // err2 ← 上上次误差
+   86   1          pid->err1 = error;       // err1 ← 上次误差
+   87   1      }
+   88          
+   89          /**
+   90           * @brief  舵机位置式PID + 前后段动态融合前馈 + 陀螺仪阻尼 + 曲率前馈 + 误差微�
+             -��
+   91           * @param  pid  舵机PID结构体指针
+   92           * @retval 无 (更新 Out_servo)
+   93           * @note   环岛模式下禁用前馈仅用反馈+陀螺仪；正常模式下按方向一致性动态调
+             -整前馈权重
+   94           */
+   95          void PID_servof(volatile PID_tf *pid)
+   96          {
+   97   1          extern int32 err_sum;
+   98   1          extern int32 err_feedforward;
+   99   1          extern float ff_confidence;
+  100   1          extern float g_ff_weight;
+  101   1          extern float g_diff_threshold;
+  102   1          extern int16 g_target_col;
+  103   1          extern uint8 ring_disable_feedforward;
+  104   1          extern int32 err_far, err_near;
+  105   1          extern uint8 valid_row_count;
+  106   1      
+  107   1          #define CURVATURE_GAIN 0.3f   // 曲率前馈增益
+  108   1          #define D_GAIN 0.2f           // 误差微分增益
+  109   1      
+  110   1          // 方向滤波和误差历史（静态保持迭代记忆）
+  111   1          static float filtered_fb_dir = 0.0f;
+  112   1          static float filtered_ff_dir = 0.0f;
+  113   1          static float last_err = 0.0f;
+  114   1      
+  115   1          float feedback_err, feedforward_err;
+  116   1          float feedback_dir, feedforward_dir;
+  117   1          float base_ff_weight, ff_weight, fb_weight;
+  118   1          float diff, conflict_ratio;
+  119   1          float err;
+  120   1          float p_out, kp2_out;
+C251 COMPILER V5.60.0,  PID                                                                21/09/26  22:45:17  PAGE 3   
+
+  121   1          float curvature, curvature_ff;
+  122   1          float d_err;
+  123   1          float duty;
+  124   1      
+  125   1          #define DIR_FILTER_ALPHA  1.0f   // 方向滤波系数(1=不过滤)
+  126   1          #define FB_DIR_DEADZONE   2.0f   // 反馈方向死区
+  127   1      
+  128   1          // ==================== 环岛模式：仅反馈控制 ====================
+  129   1          if (ring_disable_feedforward)
+  130   1          {
+  131   2              // 环岛强制转向（预置转角值）
+  132   2              if (ring_force_steer != 0)
+  133   2              {
+  134   3                  pid->out = (float)ring_force_steer;                 // 直接使用预设转角
+  135   3                  pid->out = limit_float(pid->out, OUT_MIN, OUT_MAX);
+  136   3                  duty = (float)SERVO_DUTY_MID - pid->out;            // 中值 - 偏移 = PWM值
+  137   3                  duty = limit_float(duty, (float)SERVO_DUTY_MIN, (float)SERVO_DUTY_MAX);
+  138   3                  Out_servo = (uint16)duty;
+  139   3                  return;
+  140   3              }
+  141   2      
+  142   2              // 无强制转向：只用远近段加权误差做反馈控制
+  143   2              g_steer_err = (float)err_sum - (float)g_target_col;    // 误差 = 中线加权和 - 目标中心
+             -列
+  144   2      
+  145   2              p_out   = pid->kp * g_steer_err;                        // P项：比例控制
+  146   2              kp2_out = pid->kp2 * g_steer_err * fabs(g_steer_err);   // 二次项：大误差时额外加力�
+             -�非对称，正比于误差²）
+  147   2              pid->out = p_out + kp2_out + pid->kg * ((float)imu660ra_gyro_z);  // 陀螺仪阻尼：抑制角�
+             -��度
+  148   2      
+  149   2              // 限幅 + 转换为PWM占空比
+  150   2              pid->out = limit_float(pid->out, OUT_MIN, OUT_MAX);
+  151   2              duty = (float)SERVO_DUTY_MID - pid->out;
+  152   2              duty = limit_float(duty, (float)SERVO_DUTY_MIN, (float)SERVO_DUTY_MAX);
+  153   2              Out_servo = (uint16)duty;
+  154   2              return;
+  155   2          }
+  156   1      
+  157   1          // ==================== 正常模式：反馈 + 前馈融合 ====================
+  158   1      
+  159   1          // ---- 1. 计算反馈误差和前馈误差 ----
+  160   1          feedback_err    = (float)err_sum - (float)g_target_col;        // 反馈误差：基于近场(底部)
+             -中线
+  161   1          feedforward_err = (float)err_feedforward - (float)g_target_col; // 前馈误差：基于远场(顶部
+             -)中线
+  162   1      
+  163   1          // ---- 2. 判断反馈方向与前馈方向 ----
+  164   1          // 用多行均值判断方向，减少单点噪声干扰
+  165   1          feedback_dir    = ((float)mid_line[88] + (float)mid_line[90] + (float)mid_line[92]) / 3.0f - (float)g
+             -_target_col;
+  166   1          feedforward_dir = ((float)mid_line[23] + (float)mid_line[25] + (float)mid_line[27]) / 3.0f - (float)g
+             -_target_col;
+  167   1      
+  168   1          // 一阶低通滤波平滑方向信号
+  169   1          filtered_fb_dir = DIR_FILTER_ALPHA * feedback_dir + (1.0f - DIR_FILTER_ALPHA) * filtered_fb_dir;
+  170   1          filtered_ff_dir = DIR_FILTER_ALPHA * feedforward_dir + (1.0f - DIR_FILTER_ALPHA) * filtered_ff_dir;
+  171   1      
+  172   1          // ---- 3. 根据方向一致性动态调整前馈权重 ----
+  173   1          if (fabs(filtered_fb_dir) < FB_DIR_DEADZONE)
+  174   1          {
+  175   2              // 反馈方向在死区内（近直线）：使用全量前馈权重
+  176   2              base_ff_weight = g_ff_weight;
+  177   2          }
+  178   1          else if (filtered_fb_dir * filtered_ff_dir < 0)
+  179   1          {
+C251 COMPILER V5.60.0,  PID                                                                21/09/26  22:45:17  PAGE 4   
+
+  180   2              // 前后方向相反（前馈不可靠）：大幅降低前馈权重到0.05
+  181   2              base_ff_weight = 0.05f;
+  182   2          }
+  183   1          else
+  184   1          {
+  185   2              // 方向一致但可能量值冲突：按差值比例衰减前馈权重
+  186   2              diff = fabs(feedback_err - feedforward_err);              // 远近误差差异
+  187   2              conflict_ratio = diff / g_diff_threshold;                 // 冲突比例(0~1)
+  188   2              if (conflict_ratio > 1.0f) conflict_ratio = 1.0f;
+  189   2              base_ff_weight = g_ff_weight * (1.0f - conflict_ratio);  // 差异越大权重越低
+  190   2              if (base_ff_weight < 0.05f) base_ff_weight = 0.05f;      // 保底5%
+  191   2          }
+  192   1      
+  193   1          // ---- 4. 最终前馈权重 = 基础权重 × 置信度 ----
+  194   1          ff_weight = base_ff_weight * ff_confidence;
+  195   1      
+  196   1          // ---- 5. 反馈权重：保证主导地位(70%~100%) ----
+  197   1          fb_weight = 1.0f - ff_weight + 0.4f;
+  198   1          if (fb_weight < 0.7f) fb_weight = 0.7f;   // 最低70%反馈权重
+  199   1          if (fb_weight > 1.0f) fb_weight = 1.0f;   // 最高100%
+  200   1      
+  201   1          // ---- 6. 加权融合误差 ----
+  202   1          err = fb_weight * feedback_err + ff_weight * feedforward_err;
+  203   1          g_steer_err = err;
+  204   1      
+  205   1          // ---- 7. 曲率前馈：远场和近场测得的弯道曲率 ----
+  206   1          curvature = (float)(err_far - err_near);                      // 曲率 = 远区误差 - 近区误差
+  207   1          if (curvature < -5.0f || curvature > 5.0f)
+  208   1              curvature_ff = curvature * CURVATURE_GAIN;                // 曲率>5才启用，防止直线误�
+             -��发
+  209   1          else
+  210   1              curvature_ff = 0.0f;
+  211   1      
+  212   1          // ---- 8. PID计算 ----
+  213   1          p_out   = pid->kp * err;                                      // P项：比例控制
+  214   1          kp2_out = pid->kp2 * err * fabs(err);                         // 二次项：大误差额外加力
+  215   1          pid->out = p_out + kp2_out + pid->kg * ((float)imu660ra_gyro_z) + curvature_ff;
+  216   1                                                                          //  kg项：陀螺仪角速度阻尼�
+             -��抑制过冲
+  217   1                                                                          //  curvature_ff：弯道曲率前馈
+             -，提前预判
+  218   1      
+  219   1          // ---- 9. 误差微分项：抑制震荡 ----
+  220   1          d_err = err - last_err;                                       // 误差变化率
+  221   1          last_err = err;
+  222   1          pid->out += D_GAIN * d_err;                                   // D项：微分抑制
+  223   1      
+  224   1          // ---- 10. 输出限幅 + 转换为PWM占空比 ----
+  225   1          pid->out = limit_float(pid->out, OUT_MIN, OUT_MAX);
+  226   1          duty = (float)SERVO_DUTY_MID - pid->out;                     // 中值PWM - 转向偏移 = 实际PWM
+  227   1          duty = limit_float(duty, (float)SERVO_DUTY_MIN, (float)SERVO_DUTY_MAX);  // 机械限位保护
+  228   1          Out_servo = (uint16)duty;
+  229   1      }
+
+
+Module Information          Static   Overlayable
+------------------------------------------------
+  code size            =      1426     ------
+  ecode size           =    ------     ------
+  data size            =    ------     ------
+  idata size           =    ------     ------
+  pdata size           =    ------     ------
+  xdata size           =       138         44
+  xdata-const size     =    ------     ------
+  edata size           =    ------     ------
+  bit size             =    ------     ------
+  ebit size            =    ------     ------
+C251 COMPILER V5.60.0,  PID                                                                21/09/26  22:45:17  PAGE 5   
+
+  bitaddressable size  =    ------     ------
+  ebitaddressable size =    ------     ------
+  far data size        =    ------     ------
+  huge data size       =    ------     ------
+  const size           =    ------     ------
+  hconst size          =       178     ------
+End of Module Information.
+
+
+C251 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

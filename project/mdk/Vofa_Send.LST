@@ -1,0 +1,303 @@
+C251 COMPILER V5.60.0,  Vofa_Send                                                          21/09/26  22:45:17  PAGE 1   
+
+
+C251 COMPILER V5.60.0, COMPILATION OF MODULE Vofa_Send
+OBJECT MODULE PLACED IN Vofa_Send.OBJ
+COMPILER INVOKED BY: D:\APP\DEV\KEIL5\C251\BIN\C251.EXE Vofa_Send.c LARGE INTR2 BROWSE INCDIR(..\..\libraries\zf_common;
+                    -..\..\libraries\zf_device;..\..\libraries\zf_driver;..\code;..\mdk;..\user;..\..\libraries\zf_components\seekfree_assist
+                    -ant;..\..\libraries\zf_components\stc32g_usb_lib) DEBUG
+
+stmt  level    source
+
+    1          /**
+    2           * @file    Vofa_Send.c
+    3           * @brief   VOFA+上位机通信模块：WiFi SPI数据发送(20通道)、命令接收解析
+    4           * @author  RRZ
+    5           * @date    2026-05-16
+    6           */
+    7          
+    8          #include "vofa_send.h"
+    9          #include "Wifi_Config.h"
+   10          #include "zf_device_wifi_spi.h"
+   11          #include "zf_common_headfile.h"
+   12          
+   13          #include "sevro.h"
+   14          #include "Motor.h"
+   15          #include "image.h"
+   16          #include "PID.h"
+   17          #include "Ring.h"
+   18          
+   19          // ==================== 外部变量引用 ====================
+   20          extern volatile uint16 Out_servo;
+   21          extern volatile PID_tf servo_pidf;
+   22          extern volatile PID_tf pid_lf, pid_rf;
+   23          extern int16 tar_speed;
+   24          extern int16 encoder_data_l, encoder_data_r;
+   25          extern int16 diff_left, diff_right;
+   26          extern int32 err_sum, err_feedforward;
+   27          extern float diff_kp;                 // 差速比例系数(VOFA可调)
+   28          extern uint8 ControlFlag;
+   29          extern int16 imu660ra_gyro_z;
+   30          
+   31          extern float g_ff_scale;             // 前馈缩放系数(VOFA可调)
+   32          extern float g_ff_weight;            // 前馈融合权重(VOFA可调)
+   33          extern float g_diff_threshold;       // 远近误差差异阈值(VOFA可调)
+   34          extern int16 g_base_speed;           // 目标基础速度(按键/VOFA可调)
+   35          extern uint8 g_fan_speed;            // 负压风机占空比(0-100)(按键/VOFA可调)
+   36          extern uint8 ring_state;
+   37          
+   38          // ==================== 全局变量 ====================
+   39          uint8 g_motor_enable = 0;
+   40          
+   41          // ==================== 静态变量 ====================
+   42          static uint8 inited = 0;
+   43          static uint8 send_div = 0;
+   44          static char tx_buffer[256];
+   45          static char rx_buffer[64];
+   46          static uint8 rx_index = 0;
+   47          
+   48          static void parse_command(const char *cmd);
+   49          
+   50          /**
+   51           * @brief  VOFA WiFi SPI初始化：连接WiFi并建立TCP连接
+   52           * @param  无
+   53           * @retval 无
+   54           * @note   仅在 USE_WIFI_VOFA 宏定义时生效
+   55           */
+   56          void vofa_send_init(void)
+   57          {
+C251 COMPILER V5.60.0,  Vofa_Send                                                          21/09/26  22:45:17  PAGE 2   
+
+   58   1      #ifdef USE_WIFI_VOFA
+   59   1          if (!inited)
+   60   1          {
+   61   2              wifi_spi_init(WIFI_SSID, WIFI_PASSWORD);
+   62   2              system_delay_ms(500);
+   63   2              wifi_spi_socket_connect("TCP", PC_IP_ADDR, VOFA_PORT, LOCAL_PORT);
+   64   2              inited = 1;
+   65   2          }
+   66   1      #endif
+   67   1      }
+   68          
+   69          /**
+   70           * @brief  发送数据到VOFA上位机（20个数据通道）
+   71           * @param  无
+   72           * @retval 无
+   73           * @note   按 VOFA_SEND_FRAME_DIV 分频发送，每帧格式化20个通道的CSV数据
+   74           *         I0~I4: 图像误差、舵机输出、舵机KP/KG/KP2
+   75           *         I5~I7: 电机KP/KI/KD
+   76           *         I8: 基础速度
+   77           *         I9~I11: 前馈参数(缩放/权重/阈值)
+   78           *         I12~I15: 左右目标速度/实际速度
+   79           *         I16: 陀螺仪角速度
+   80           *         I17: 差速系数
+   81           *         I18: 环岛状态(×100放大)
+   82           *         I19: 风扇占空比
+   83           */
+   84          void vofa_send_data(void)
+   85          {
+   86   1          char *ptr;
+   87   1          int len;
+   88   1          float img_err, steer_out, steer_p, steer_kg, steer_kp2;
+   89   1          float motor_kp, motor_ki, motor_kd;
+   90   1          float base_speed;
+   91   1          float ff_scale, ff_weight, diff_thres;
+   92   1          float left_target, left_actual, right_target, right_actual;
+   93   1          float gyro_z;
+   94   1          float diff_kp_val;
+   95   1      
+   96   1          if (!inited) return;
+   97   1      
+   98   1          send_div++;
+   99   1          if (send_div < VOFA_SEND_FRAME_DIV) return;   // VOFA发送分频，每N帧发1次
+  100   1          send_div = 0;
+  101   1      
+  102   1          img_err   = (float)(err_sum - Mid_Col);
+  103   1          steer_out = (float)Out_servo - (float)SERVO_DUTY_MID;
+  104   1          steer_p   = servo_pidf.kp;
+  105   1          steer_kg  = servo_pidf.kg;
+  106   1          steer_kp2 = servo_pidf.kp2;
+  107   1      
+  108   1          motor_kp = pid_lf.kp;
+  109   1          motor_ki = pid_lf.ki;
+  110   1          motor_kd = pid_lf.kd;
+  111   1      
+  112   1          base_speed = (float)g_base_speed;
+  113   1      
+  114   1          ff_scale  = g_ff_scale;
+  115   1          ff_weight = g_ff_weight;
+  116   1          diff_thres = g_diff_threshold;
+  117   1      
+  118   1          left_target = (float)(tar_speed + diff_left);
+  119   1          left_actual = (float)encoder_data_l;
+  120   1          right_target = (float)(tar_speed + diff_right);
+  121   1          right_actual = (float)encoder_data_r;
+  122   1      
+  123   1          gyro_z = (float)imu660ra_gyro_z;
+C251 COMPILER V5.60.0,  Vofa_Send                                                          21/09/26  22:45:17  PAGE 3   
+
+  124   1          diff_kp_val = diff_kp;
+  125   1      
+  126   1          ptr = tx_buffer;
+  127   1      
+  128   1          // I0 ~ I4（图像误差、舵机输出、舵机PID）
+  129   1          len = sprintf(ptr, "%.1f,%.1f,%.2f,%.3f,%.5f,",
+  130   1                        img_err, steer_out, steer_p, steer_kg, steer_kp2);
+  131   1          ptr += len;
+  132   1      
+  133   1          // I5 ~ I7（电机PID）
+  134   1          len = sprintf(ptr, "%.3f,%.3f,%.3f,", motor_kp, motor_ki, motor_kd);
+  135   1          ptr += len;
+  136   1      
+  137   1          // I8（基础速度）
+  138   1          len = sprintf(ptr, "%.1f,", base_speed);
+  139   1          ptr += len;
+  140   1      
+  141   1          // I9 ~ I15（前馈3个 + 电机4个）
+  142   1          len = sprintf(ptr, "%.2f,%.2f,%.1f,%.1f,%.1f,%.1f,%.1f,",
+  143   1                        ff_scale, ff_weight, diff_thres,
+  144   1                        left_target, left_actual, right_target, right_actual);
+  145   1          ptr += len;
+  146   1      
+  147   1          // I16（陀螺仪角速度）
+  148   1          len = sprintf(ptr, "%.1f,", gyro_z);
+  149   1          ptr += len;
+  150   1      
+  151   1          // I17（差速系数 diff_kp）
+  152   1           len = sprintf(ptr, "%.2f,", diff_kp_val);
+  153   1          ptr += len;
+  154   1      
+  155   1          // I18（环岛状态）
+  156   1          len = sprintf(ptr, "%d,", ring_state * 100);
+  157   1          ptr += len;
+  158   1      
+  159   1          // I19（风扇占空比百分比）
+  160   1          sprintf(ptr, "%d\n", g_fan_speed);
+  161   1      
+  162   1          wifi_spi_send_string(tx_buffer);
+  163   1      }
+  164          
+  165          /**
+  166           * @brief  检查并解析WiFi接收缓冲区中的VOFA命令
+  167           * @param  无
+  168           * @retval 无
+  169           * @note   以'!'为命令结束符，逐字节接收，完整命令后调用 parse_command()
+  170           */
+  171          void vofa_check_receive(void)
+  172          {
+  173   1          uint8 byte;
+  174   1          uint32 len;
+  175   1      
+  176   1          if (!inited) return;
+  177   1      
+  178   1          while (1)
+  179   1          {
+  180   2              len = wifi_spi_read_buffer(&byte, 1);
+  181   2              if (len == 0) break;
+  182   2      
+  183   2              if (byte == '!')
+  184   2              {
+  185   3                  rx_buffer[rx_index] = '\0';
+  186   3                  parse_command(rx_buffer);
+  187   3                  rx_index = 0;
+  188   3              }
+  189   2              else
+C251 COMPILER V5.60.0,  Vofa_Send                                                          21/09/26  22:45:17  PAGE 4   
+
+  190   2              {
+  191   3                  if (rx_index < sizeof(rx_buffer) - 1)
+  192   3                      rx_buffer[rx_index++] = byte;
+  193   3              }
+  194   2          }
+  195   1      }
+  196          
+  197          /**
+  198           * @brief  解析VOFA命令并执行对应操作
+  199           * @param  cmd  以\0结尾的命令字符串
+  200           * @retval 无
+  201           * @note   支持实时调节PID参数、速度、前馈参数、风扇、启停
+  202           *         命令格式: 参数名=浮点值! 或 start!/stop!
+  203           */
+  204          static void parse_command(const char *cmd)
+  205          {
+  206   1          float val;
+  207   1      
+  208   1          if (sscanf(cmd, "kp=%f", &val) == 1) {          // 舵机KP
+  209   2              servo_pidf.kp = val;
+  210   2          }
+  211   1          else if (sscanf(cmd, "kg=%f", &val) == 1) {     // 陀螺仪阻尼系数
+  212   2              servo_pidf.kg = val;
+  213   2          }
+  214   1          else if (sscanf(cmd, "kp_two=%f", &val) == 1) { // 舵机二次项系数
+  215   2              servo_pidf.kp2 = val;
+  216   2          }
+  217   1          else if (sscanf(cmd, "motor_kp=%f", &val) == 1) { // 电机KP(左右同步)
+  218   2              pid_lf.kp = val;
+  219   2              pid_rf.kp = val;
+  220   2          }
+  221   1          else if (sscanf(cmd, "motor_ki=%f", &val) == 1) { // 电机KI(左右同步)
+  222   2              pid_lf.ki = val;
+  223   2              pid_rf.ki = val;
+  224   2          }
+  225   1          else if (sscanf(cmd, "motor_kd=%f", &val) == 1) { // 电机KD(左右同步)
+  226   2              pid_lf.kd = val;
+  227   2              pid_rf.kd = val;
+  228   2          }
+  229   1          else if (sscanf(cmd, "ff_scale=%f", &val) == 1) { // 前馈缩放系数
+  230   2              g_ff_scale = val;
+  231   2          }
+  232   1          else if (sscanf(cmd, "ff_weight=%f", &val) == 1) { // 前馈融合权重
+  233   2              g_ff_weight = val;
+  234   2          }
+  235   1          else if (sscanf(cmd, "diff_thres=%f", &val) == 1) { // 远近误差差异阈值
+  236   2              g_diff_threshold = val;
+  237   2          }
+  238   1          else if (sscanf(cmd, "base_speed=%f", &val) == 1) { // 基础速度
+  239   2              g_base_speed = (int16)val;
+  240   2          }
+  241   1          else if (sscanf(cmd, "diff_kp=%f", &val) == 1) { // 差速比例系数
+  242   2              diff_kp = val;
+  243   2          }
+  244   1              else if (sscanf(cmd, "fan=%f", &val) == 1) {     // 风扇占空比(0-100)
+  245   2                      if (val < 0) val = 0;
+  246   2                      if (val > 100) val = 100;
+  247   2                      g_fan_speed = val;
+  248   2                      Negative_Pressure(g_fan_speed);
+  249   2              }
+  250   1          else if (strcmp(cmd, "start") == 0) {            // 启动
+  251   2              g_motor_enable = 1;
+  252   2              ControlFlag = 1;
+  253   2          }
+  254   1          else if (strcmp(cmd, "stop") == 0) {             // 停止
+  255   2              g_motor_enable = 0;
+C251 COMPILER V5.60.0,  Vofa_Send                                                          21/09/26  22:45:17  PAGE 5   
+
+  256   2              ControlFlag = 0;
+  257   2              Ring_Init();
+  258   2              Motor_Stop();
+  259   2          }
+  260   1      }
+
+
+Module Information          Static   Overlayable
+------------------------------------------------
+  code size            =      1959     ------
+  ecode size           =    ------     ------
+  data size            =    ------     ------
+  idata size           =    ------     ------
+  pdata size           =    ------     ------
+  xdata size           =       324         59
+  xdata-const size     =    ------     ------
+  edata size           =    ------     ------
+  bit size             =    ------     ------
+  ebit size            =    ------     ------
+  bitaddressable size  =    ------     ------
+  ebitaddressable size =    ------     ------
+  far data size        =    ------     ------
+  huge data size       =    ------     ------
+  const size           =    ------     ------
+  hconst size          =       302     ------
+End of Module Information.
+
+
+C251 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

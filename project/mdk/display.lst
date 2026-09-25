@@ -1,0 +1,179 @@
+C251 COMPILER V5.60.0,  display                                                            21/09/26  22:45:15  PAGE 1   
+
+
+C251 COMPILER V5.60.0, COMPILATION OF MODULE display
+OBJECT MODULE PLACED IN .\display.obj
+COMPILER INVOKED BY: D:\APP\DEV\KEIL5\C251\BIN\C251.EXE ..\code\display.c LARGE INTR2 BROWSE INCDIR(..\..\libraries\zf_c
+                    -ommon;..\..\libraries\zf_device;..\..\libraries\zf_driver;..\code;..\mdk;..\user;..\..\libraries\zf_components\seekfree_
+                    -assistant;..\..\libraries\zf_components\stc32g_usb_lib) DEBUG PRINT(.\display.lst) OBJECT(.\display.obj) 
+
+stmt  level    source
+
+    1          /**
+    2           * @file    display.c
+    3           * @brief   屏幕显示模块：IPS200/IPS200Pro/TFT180初始化、绘图辅助、调试信息显示
+    4           * @author  RRZ
+    5           * @date    2026-05-16
+    6           */
+    7          
+    8          #include "display.h"
+    9          
+   10          uint32 ips200pro_stack_size;
+   11          
+   12          // 页面创建后返回的页ID，当需要对页面进行操作时，需要传入对应的ID
+   13          uint16 page_id[3];
+   14          
+   15          uint16 camera_id;
+   16          
+   17          ips200pro_image_line_uint8_struct border1[MT9V03X_H];
+   18          ips200pro_image_line_uint8_struct border2[MT9V03X_H];
+   19          uint8 i = 0;
+   20          
+   21          uint16 rectangle_x = 0;
+   22          uint8  temp_start = 10;
+   23          
+   24          
+   25          /**
+   26           * @brief  IPS200Pro屏幕高级初始化：创建页面、设置颜色主题、创建图像控件
+   27           * @param  无
+   28           * @retval 无
+   29           * @note   设置第一页标题"智能车比赛"、背景色、前景色
+   30           */
+   31          void display_init_pro(void)
+   32          {
+   33   1      
+   34   1          // 初始化屏幕并新建一个页面
+   35   1          page_id[0] = ips200pro_init("智能车比赛", IPS200PRO_TITLE_BOTTOM, 30);
+   36   1      
+   37   1          // 获取屏幕信息并赋值给相关变量 1064是屏幕接口没有焊接芯片时miso引脚无�
+             -�使用获取的功能
+   38   1          ips200pro_get_information(&ips200pro_information);
+   39   1          ips200pro_get_free_stack_size(&ips200pro_stack_size);
+   40   1          ips200pro_get_time(&ips200pro_time);
+   41   1      
+   42   1          // 设置全局字体为16号
+   43   1          ips200pro_set_default_font(FONT_SIZE_16);
+   44   1      
+   45   1          // 屏幕方向设置为竖屏
+   46   1          ips200pro_set_direction(IPS200PRO_PORTRAIT);
+   47   1      
+   48   1          // 设置编码格式
+   49   1          ips200pro_set_format(IPS200PRO_FORMAT_GBK);
+   50   1      
+   51   1          // 设置选中页面的标题背景颜色，需要写入第一个参数生成的页面ID等等
+   52   1          ips200pro_set_color(page_id[0], COLOR_PAGE_SELECTED_BG, IPS200PRO_RGB888_TO_RGB565(0xFF, 0xE3, 0xE3))
+             -;
+   53   1      
+   54   1          // 设置第一个页面的背景色
+   55   1          ips200pro_set_color(page_id[0], COLOR_BACKGROUND, IPS200PRO_RGB888_TO_RGB565(0x43, 0x4A, 0x61));
+C251 COMPILER V5.60.0,  display                                                            21/09/26  22:45:15  PAGE 2   
+
+   56   1      
+   57   1          // 设置页面文字的背景颜色，需要写入第一个参数生成的页面ID等等
+   58   1          ips200pro_set_color(page_id[0], COLOR_FOREGROUND, RGB565_BLACK);
+   59   1      
+   60   1          // 设置页面选中后的文字背景颜色，需要写入第一个参数生成的页面ID等等
+   61   1          ips200pro_set_color(page_id[0], COLOR_PAGE_SELECTED_TEXT, RGB565_WHITE);
+   62   1      
+   63   1          // 设置屏幕的背光亮度，有效设置范围0-255
+   64   1          ips200pro_set_backlight(255);   // 背光亮度(0-255)，降低可省电
+   65   1      
+   66   1          // 切换页面，切换到第一个页面
+   67   1          ips200pro_page_switch(page_id[0] ,PAGE_ANIM_ON);
+   68   1      
+   69   1          // 创建一个图像控件，图像控件没有任何的默认颜色
+   70   1          camera_id = ips200pro_image_create(26, 20, MT9V03X_W, MT9V03X_H);   // 图像在屏幕上的显示起
+             -始坐标(26,20)
+   71   1      
+   72   1      }
+   73          
+   74          /**
+   75           * @brief  IPS200基础初始化（非Pro版本）
+   76           * @param  无
+   77           * @retval 无
+   78           */
+   79          void display_init(void)
+   80          {
+   81   1          ips200_init();
+   82   1      }
+   83          
+   84          /**
+   85           * @brief  在屏幕上画一列像素
+   86           * @param  col    列坐标
+   87           * @param  h      高度
+   88           * @param  start  起始行
+   89           * @param  color  颜色
+   90           * @retval 无
+   91           */
+   92          void isp_200_draw_col(uint8 col ,uint8 h,uint8 start,uint16 color)
+   93          {
+   94   1          uint8 i=0;
+   95   1          for(i=start;i<start+h;i++){
+   96   2              ips200_draw_point(col,i,color);
+   97   2          }
+   98   1      }
+   99          
+  100          /**
+  101           * @brief  在屏幕上画一行像素
+  102           * @param  row    行坐标
+  103           * @param  w      宽度
+  104           * @param  start  起始列
+  105           * @param  color  颜色
+  106           * @retval 无
+  107           */
+  108          void isp_200_draw_row(uint8 row ,uint8 w,uint8 start,uint16 color)
+  109          {
+  110   1          uint8 i=0;
+  111   1          for(i=start;i<start+w;i++){
+  112   2              ips200_draw_point(i,row,color);
+  113   2          }
+  114   1      }
+  115          
+  116          /**
+  117           * @brief  显示电机调试信息（编码器/PID参数），当前已注释
+  118           * @param  无
+  119           * @retval 无
+  120           */
+C251 COMPILER V5.60.0,  display                                                            21/09/26  22:45:15  PAGE 3   
+
+  121          void display_motor(void)
+  122          {
+  123   1      //      ips200_show_string(0,0,"Encoder L R:");
+  124   1      //      ips200_show_int16(100,0,encoder_data_l);
+  125   1      //      ips200_show_int16(164,0,encoder_data_r);
+  126   1      //
+  127   1      //      ips200_show_string(0,32,"tar_speed:");
+  128   1      //      ips200_show_int16(80,32,tar_speed);
+  129   1      //
+  130   1      //      ips200_show_string(0,64,"L Kp Ki:");
+  131   1      //      ips200_show_int16(80,64,pi_l.kp_q);
+  132   1      //      ips200_show_int16(128,64,pi_l.ki_q);
+  133   1      //
+  134   1      //      ips200_show_string(0,96,"R Kp Ki:");
+  135   1      //      ips200_show_int16(80,96,pi_r.kp_q);
+  136   1      //      ips200_show_int16(128,96,pi_r.ki_q);
+  137   1      }
+
+
+Module Information          Static   Overlayable
+------------------------------------------------
+  code size            =       323     ------
+  ecode size           =    ------     ------
+  data size            =    ------     ------
+  idata size           =    ------     ------
+  pdata size           =    ------     ------
+  xdata size           =       496          4
+  xdata-const size     =    ------     ------
+  edata size           =    ------     ------
+  bit size             =    ------     ------
+  ebit size            =    ------     ------
+  bitaddressable size  =    ------     ------
+  ebitaddressable size =    ------     ------
+  far data size        =    ------     ------
+  huge data size       =    ------     ------
+  const size           =    ------     ------
+  hconst size          =        35     ------
+End of Module Information.
+
+
+C251 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

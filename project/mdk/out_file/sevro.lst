@@ -1,0 +1,124 @@
+C251 COMPILER V5.60.0,  sevro                                                              14/06/26  22:56:47  PAGE 1   
+
+
+C251 COMPILER V5.60.0, COMPILATION OF MODULE sevro
+OBJECT MODULE PLACED IN .\out_file\sevro.obj
+COMPILER INVOKED BY: D:\Keil C251\Keil C251\C251\BIN\C251.EXE ..\code\sevro.c LARGE ROM(HUGE) WARNINGLEVEL(3) OPTIMIZE(0
+                    -,SIZE) BROWSE INCDIR(..\..\libraries\zf_common;..\..\libraries\zf_components;..\..\libraries\zf_device;..\..\libraries\z
+                    -f_driver;..\user;..\code;..\..\libraries\zf_components\stc32g_usb_lib;..\..\libraries\zf_components\seekfree_assistant) 
+                    -DEBUG PRINT(.\out_file\sevro.lst) OBJECT(.\out_file\sevro.obj) 
+
+stmt  level    source
+
+    1          /**
+    2           * @file    sevro.c
+    3           * @brief   舵机驱动：角度设定、PWM初始化、中值死区滤波、负压风机控制
+    4           * @author  RRZ
+    5           * @date    2026-05-16
+    6           */
+    7          
+    8          #include "sevro.h"
+    9          
+   10          uint8 g_fan_speed = 0;   // 负压风机占空比(0-100)(按键/VOFA可调)
+   11          
+   12          /**
+   13           * @brief  设置舵机角度（相对87.5度中值±12.5度）
+   14           */
+   15          void servo_setAngle(pwm_channel_enum sever, float angle)
+   16          {
+   17   1          // 角度限幅：只允许±12.5度范围
+   18   1          if (angle > 12.5 || angle < -12.5) return;
+   19   1      
+   20   1          // 转换为舵机绝对角度：中值87.5度，左转 angle 度
+   21   1          angle = 87.5 - angle;
+   22   1      
+   23   1          // 计算占空比并输出
+   24   1          pwm_set_duty(sever, SERVO_DUTY(angle));
+   25   1      }
+   26          
+   27          /**
+   28           * @brief  舵机4通道PWM初始化，SERVO_PWM1初始化为中值
+   29           */
+   30          void servo_init(void)
+   31          {
+   32   1          // 四路PWM初始化：舵机1=中值，舵机2/3/4=0（2空闲/3风机/4风机）
+   33   1          pwm_init(SERVO_PWM1, SERVO_FREQ, SERVO_DUTY(87.5));
+   34   1          pwm_init(SERVO_PWM2, SERVO_FREQ, 0);
+   35   1          pwm_init(SERVO_PWM3, SERVO_FREQ, 0);
+   36   1          pwm_init(SERVO_PWM4, SERVO_FREQ, 0);
+   37   1      
+   38   1          // 手动精确设置舵机1中值占空比为4450（消除浮点计算误差）
+   39   1          pwm_set_duty(SERVO_PWM1, 4450);
+   40   1      }
+   41          
+   42          /**
+   43           * @brief  舵机中值死区过滤：4485~4565范围强制输出4450，消除中位抖动
+   44           */
+   45          volatile uint16 huQiqiangServo(volatile uint16 input)
+   46          {
+   47   1          // 中值死区(4485~4565) → 统一输出4450（中值）
+   48   1          if ((input < 4565) && (input > 4485))
+   49   1          {
+   50   2              return (volatile uint16)4450;
+   51   2          }
+   52   1          // 死区外原样输出
+   53   1          return input;
+   54   1      }
+   55          
+   56          /**
+C251 COMPILER V5.60.0,  sevro                                                              14/06/26  22:56:47  PAGE 2   
+
+   57           * @brief  舵机主循环：运行PID并输出PWM
+   58           */
+   59          void Servo_Loop(void)
+   60          {
+   61   1          // 运行舵机位置式PID，更新 Out_servo
+   62   1          PID_servof(&servo_pidf);
+   63   1      
+   64   1          // 将PID计算结果输出到舵机PWM通道
+   65   1          pwm_set_duty(SERVO_PWM1, (uint32)Out_servo);
+   66   1      }
+   67          
+   68          /**
+   69           * @brief  负压风机控制：0~100%占空比 → 50Hz PWM(1.0~1.8ms脉宽)
+   70           * @param  duty  占空比(0-100)
+   71           */
+   72          void Negative_Pressure(uint32 duty)
+   73          {
+   74   1          uint32 PWM;
+   75   1      
+   76   1          // 占空比→PWM寄存器值：duty*24 + 3000（3000基准=100%占空/50Hz对应值）
+   77   1          PWM = duty * 24 + 3000;
+   78   1      
+   79   1          // 限幅保护：1.0ms~1.8ms 脉宽对应 3000~5400
+   80   1          if (PWM > 5400) PWM = 5400;   // 上限=1.8ms脉宽
+   81   1          if (PWM < 3000) PWM = 3000;   // 下限=1.0ms脉宽
+   82   1      
+   83   1          // 双通道同步输出（两路风机并联）
+   84   1          pwm_set_duty(SERVO_PWM3, PWM);
+   85   1          pwm_set_duty(SERVO_PWM4, PWM);
+   86   1      }
+
+
+Module Information          Static   Overlayable
+------------------------------------------------
+  code size            =    ------     ------
+  ecode size           =       483     ------
+  data size            =    ------     ------
+  idata size           =    ------     ------
+  pdata size           =    ------     ------
+  xdata size           =        17     ------
+  xdata-const size     =    ------     ------
+  edata size           =    ------     ------
+  bit size             =    ------     ------
+  ebit size            =    ------     ------
+  bitaddressable size  =    ------     ------
+  ebitaddressable size =    ------     ------
+  far data size        =    ------     ------
+  huge data size       =    ------     ------
+  const size           =    ------     ------
+  hconst size          =         6     ------
+End of Module Information.
+
+
+C251 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

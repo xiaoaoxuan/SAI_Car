@@ -1,0 +1,904 @@
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 1   
+
+
+C251 COMPILER V5.60.0, COMPILATION OF MODULE image
+OBJECT MODULE PLACED IN .\image.obj
+COMPILER INVOKED BY: D:\APP\DEV\KEIL5\C251\BIN\C251.EXE ..\code\image.c LARGE INTR2 BROWSE INCDIR(..\..\libraries\zf_com
+                    -mon;..\..\libraries\zf_device;..\..\libraries\zf_driver;..\code;..\mdk;..\user;..\..\libraries\zf_components\seekfree_as
+                    -sistant;..\..\libraries\zf_components\stc32g_usb_lib) DEBUG PRINT(.\image.lst) OBJECT(.\image.obj) 
+
+stmt  level    source
+
+    1          /**
+    2           * @file    image.c
+    3           * @brief   视觉图像处理核心：参考点计算、边线搜索、中线合成、偏差计算、丢
+             -线外推、前馈、斑马线/十字路口检测
+    4           * @author  RRZ
+    5           * @date    2026-05-16
+    6           */
+    7          
+    8          #include "image.h"
+    9          #include "init.h"
+   10          #include "PID.h"
+   11          
+   12          int32 err_feedforward = 0;
+   13          float ff_confidence = 1.0f;
+   14          
+   15          float g_ff_scale = 1.5f;           // 前馈缩放系数(VOFA可调)
+   16          float g_ff_weight = 0.3f;          // 前馈基础权重(VOFA可调)
+   17          float g_diff_threshold = 35.0f;    // 前后段差值冲突阈值(VOFA可调)
+   18          float g_ff_quality_high = 0.8f;
+   19          float g_ff_quality_low = 0.5f;
+   20          
+   21          extern uint8 ring_exit_compensate;
+   22          extern uint8 ring_compensate;
+   23          extern uint8 ring_comp_line[];
+   24          extern uint8 upper_turn_row;
+   25          extern uint8 exit_turn_row;
+   26          extern uint8 ring_state;
+   27          extern uint8 exit_turn_locked;
+   28          
+   29          uint8 ff_cancelled = 0;
+   30          
+   31          uint8 crosswalk_detected = 0;
+   32          uint8 crosswalk_stop_flag = 0;
+   33          
+   34          uint8 crossroad_detected = 0;
+   35          uint8 cross_state = 0;
+   36          static uint8 cross_confirm_cnt = 0;
+   37          
+   38          uint8 left_control_line[SEARCH_IMAGE_H];
+   39          uint8 right_control_line[SEARCH_IMAGE_H];
+   40          
+   41          uint8 left_edge_raw[SEARCH_IMAGE_H];
+   42          uint8 right_edge_raw[SEARCH_IMAGE_H];
+   43          
+   44          uint8 far image_copy[MT9V03X_H][MT9V03X_W];
+   45          
+   46          /**
+   47           * @brief  计算两像素的和差比对比度: |diff| * 200 / (sum + 1)，值越大差异越显著
+   48           * @param  temp1  像素值1
+   49           * @param  temp2  像素值2
+   50           * @retval 对比度值
+   51           * @note   和差比公式: contrast = |A-B| / (A+B) * 200
+   52           *         分母+1防止除零；200是放大系数，使结果在0~200范围
+   53           */
+   54          uint16 get_contrast(uint8 temp1, uint8 temp2)
+   55          {
+   56   1          int16 diff = (int16)temp1 - (int16)temp2;                     // 带符号差值
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 2   
+
+   57   1          return  (uint16)((diff < 0 ? -diff : diff) * 200 / (temp1 + temp2 + 1));  // 和差比
+   58   1      }
+   59          
+   60          uint8 reference_point;      // 参考曝光值（底部几行的平均灰度）
+   61          uint8 white_max_point;      // 白点上限（高于此值视为过曝/白色赛道）
+   62          uint8 white_min_point;      // 白点下限（低于此值视为黑色/暗区）
+   63          
+   64          /**
+   65           * @brief  从图像底部 REFRENCE_ROW 行计算参考曝光值，自适应光照
+   66           * @param  image  原始灰度图像指针
+   67           * @retval 无 (更新全局 reference_point / white_max_point / white_min_point)
+   68           * @note   用底部几行的平均灰度作为曝光基准，
+   69           *         white_max/white_min 通过倍率系数缩放并限幅到 [BALACK_POINT, 230]
+   70           */
+   71          void get_reference_point(const uint8 *image)
+   72          {
+   73   1          uint16 i;
+   74   1          // 定位到底部 REFRENCE_ROW 行的起始位置
+   75   1          uint8 *p = image + (SEARCH_IMAGE_H - REFRENCE_ROW) * SEARCH_IMAGE_W;
+   76   1          uint16 temp = 0;
+   77   1          uint32 tempSum = 0;
+   78   1      
+   79   1          // 统计底部 REFRENCE_ROW 行的像素总数
+   80   1          temp = REFRENCE_ROW * SEARCH_IMAGE_W;
+   81   1      
+   82   1          // 累加所有像素值
+   83   1          for (i = 0; i < temp; i++) {
+   84   2              tempSum += *(p + i);
+   85   2          }
+   86   1      
+   87   1          // 计算平均值作为参考曝光点
+   88   1          reference_point = (uint8)(tempSum / temp);
+   89   1      
+   90   1          // 白点上限 = 参考值 * WHITE_MAX_MUL/10，下限 = 参考值 * WHITE_MIN_MUL/10
+   91   1          // 限幅到 [BALACK_POINT, 230] 防止极端光照下溢出
+   92   1          white_max_point = (uint8)func_limit_ab(reference_point * WHITE_MAX_MUL / 10, BALACK_POINT, 230);
+   93   1          white_min_point = (uint8)func_limit_ab(reference_point * WHITE_MIN_MUL / 10, BALACK_POINT, 230);
+   94   1      }
+   95          
+   96          uint8 refenence_col_line[SEARCH_IMAGE_H];
+   97          uint8 reference_contrast_ratio = 23;   // 边线和差比阈值，越大检测越严格
+   98          uint8 reference_col;
+   99          
+  100          /**
+  101           * @brief  搜索参考列：从底部向上扫，找和差比最早超阈值或到达 STOP_ROW 的列
+  102           * @param  image  原始灰度图像指针
+  103           * @retval 无 (更新 reference_col)
+  104           * @note   逐列扫描，每列从底向上找最早出现"白点或高对比度"的位置，
+  105           *         取位置最低的列作为参考列（即最靠近图像的赛道中心列）
+  106           */
+  107          void Search_reference_col(const uint8 *image)
+  108          {
+  109   1          uint8 col, row, temp1, temp2, i;
+  110   1          uint8 globe_remote = 120, globe_remote_min = 120;   // 最远有效行和全局最小行
+  111   1          uint16 contrast = 0;
+  112   1      
+  113   1          // 初始化为图像中心列
+  114   1          reference_col = SEARCH_IMAGE_W / 2;
+  115   1      
+  116   1          // 圆环定向扫描模式下不更新参考列（使用环岛预设值）
+  117   1          if (ring_scan_dir != 0) return;
+  118   1      
+  119   1          // ---- 逐列扫描 ----
+  120   1          for (col = 0; col < SEARCH_IMAGE_W; col += PIXEL_OFFSET)
+  121   1          {
+  122   2              globe_remote = 120;
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 3   
+
+  123   2      
+  124   2              // ---- 从底部向上扫描该列 ----
+  125   2              for (row = SEARCH_IMAGE_H - 1; row > PIXEL_OFFSET; row -= PIXEL_OFFSET)
+  126   2              {
+  127   3                  temp1 = *(image + row * SEARCH_IMAGE_W + col);                          // 当前像素
+  128   3                  temp2 = *(image + (row - PIXEL_OFFSET) * SEARCH_IMAGE_W + col);         // 上方像素
+  129   3      
+  130   3                  if (temp2 > white_max_point)
+  131   3                  {
+  132   4                      // 上方像素太亮（过曝/白色赛道）→ 跳过此行
+  133   4                      continue;
+  134   4                  }
+  135   3                  else if (temp1 < white_min_point)
+  136   3                  {
+  137   4                      // 当前像素很暗（黑线）→ 记录位置并结束该列扫描
+  138   4                      if (globe_remote > row)
+  139   4                          globe_remote = row;
+  140   4                      break;
+  141   4                  }
+  142   3      
+  143   3                  // 计算和差比对比度
+  144   3                  contrast = get_contrast(temp1, temp2);
+  145   3      
+  146   3                  // 对比度超阈值 或 到达顶部停止行 → 记录有效位置
+  147   3                  if (contrast > reference_contrast_ratio || row == STOP_ROW)
+  148   3                  {
+  149   4                      if (globe_remote > row)
+  150   4                          globe_remote = row;
+  151   4                  }
+  152   3              }
+  153   2      
+  154   2              // 取最靠底部（行号最大）的列作为参考列
+  155   2              if (globe_remote < globe_remote_min)
+  156   2              {
+  157   3                  globe_remote_min = globe_remote;
+  158   3                  reference_col = col;
+  159   3              }
+  160   2          }
+  161   1      
+  162   1          // 填充参考列数组（所有行统一使用该列）
+  163   1          for (i = 0; i < SEARCH_IMAGE_H; i++)
+  164   1              refenence_col_line[i] = reference_col;
+  165   1      }
+  166          
+  167          uint8 left_edge_line[SEARCH_IMAGE_H];
+  168          uint8 right_edge_line[SEARCH_IMAGE_H];
+  169          uint8 mid_line[SEARCH_IMAGE_H];
+  170          uint8 lost_left, lost_right;     // 左右丢线行号
+  171          
+  172          /**
+  173           * @brief  双边搜索：和差比阈值检测赛道左右边线，两轮搜索+圆环定向扫描+出�
+             -�补偿
+  174           * @param  image  原始灰度图像指针
+  175           * @retval 无 (更新 left_edge_line[] / right_edge_line[] / left_edge_raw[] / right_edge_raw[])
+  176           * @note   核心搜索算法:
+  177           *         1) 从底部向上逐行scan，对每行左右两侧分别用和差比搜索边线
+  178           *         2) 两轮搜索：第一轮从参考列附近开始，第二轮从参考列重新搜索
+  179           *         3) 找到边线后收缩搜索窗口(SEARCH_RANGE)，下一行在附近搜
+  180           *         4) 圆环定向扫描：ring_scan_dir≠0时沿圆环方向找边线
+  181           *         5) 出口补偿：ring_exit_compensate时保留出口拐点下的控制线
+  182           */
+  183          void Search_line(const uint8 *image)
+  184          {
+  185   1          const uint8 *p = image;
+  186   1          uint8 row_max = SEARCH_IMAGE_H - 1;
+  187   1          uint8 row_min = STOP_ROW;
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 4   
+
+  188   1          uint8 col_max = SEARCH_IMAGE_W - 1;
+  189   1          uint8 col_min = 0;
+  190   1      
+  191   1          // 初始搜索起点：参考列左右各偏移5
+  192   1          uint8 left_start_col  = reference_col - 5;
+  193   1          uint8 right_start_col = reference_col + 5;
+  194   1          uint8 left_end_col    = col_min;
+  195   1          uint8 right_end_col   = SEARCH_IMAGE_W - 1;
+  196   1      
+  197   1          uint8 search_time;
+  198   1          uint8 temp1, temp2;
+  199   1          int16 contrast;
+  200   1      
+  201   1          uint8 left_stop = 0, right_stop = 0, stop_point = 0;
+  202   1          uint8 col, row;
+  203   1      
+  204   1          // ---- 初始化：所有边线值设为默认（左=0贴边, 右=最右贴边）----
+  205   1          lost_left  = STOP_ROW;
+  206   1          lost_right = STOP_ROW;
+  207   1          for (row = row_max; row >= row_min; row--)
+  208   1          {
+  209   2              left_edge_line[row]  = 0;
+  210   2              right_edge_line[row] = SEARCH_IMAGE_W - 1;
+  211   2          }
+  212   1      
+  213   1          // ---- 逐行扫描（从底部向上，步长 PIXEL_OFFSET）----
+  214   1          for (row = row_max; row >= row_min; row -= PIXEL_OFFSET)
+  215   1          {
+  216   2              p = image + row * SEARCH_IMAGE_W;   // 当前行首地址
+  217   2      
+  218   2              // ========== 左侧边线搜索 ==========
+  219   2              {
+  220   3                  search_time = 2;    // 两轮搜索
+  221   3                  do
+  222   3                  {
+  223   4                      // 第二轮：从参考列重新开始搜（扩大搜索范围）
+  224   4                      if (search_time == 1)
+  225   4                      {
+  226   5                          left_start_col = reference_col;
+  227   5                          left_end_col   = col_min;
+  228   5                      }
+  229   4                      search_time--;
+  230   4      
+  231   4                      // 从 start_col 向左侧扫描
+  232   4                      for (col = left_start_col; col > left_end_col + PIXEL_OFFSET; col -= PIXEL_OFFSET)
+  233   4                      {
+  234   5                          temp1 = *(p + col);                              // 当前像素
+  235   5                          temp2 = *(p + col - PIXEL_OFFSET);              // 左侧像素
+  236   5      
+  237   5                          // 起始列就是黑点 → 丢线标记
+  238   5                          if (temp1 < white_min_point && col == left_start_col && left_start_col == reference_c
+             -ol)
+  239   5                          {
+  240   6                              // 该列起始就是黑色 → 整段丢线
+  241   6                              for (stop_point = row; stop_point > 1; stop_point--)
+  242   6                                  left_edge_line[stop_point] = col_min;
+  243   6                              lost_left = row;
+  244   6                              search_time = 0;
+  245   6                              break;
+  246   6                          }
+  247   5      
+  248   5                          // 当前像素是黑点 → 找到边线
+  249   5                          if (temp1 < white_min_point)
+  250   5                          {
+  251   6                              left_edge_line[row] = col;
+  252   6                              break;
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 5   
+
+  253   6                          }
+  254   5      
+  255   5                          // 左侧像素是白点 → 跳过（不在边线上）
+  256   5                          if (temp2 > white_max_point) continue;
+  257   5      
+  258   5                          // 和差比检测：当前暗、左侧亮 = 赛道边界
+  259   5                          contrast = get_contrast(temp1, temp2);
+  260   5                          if (contrast > reference_contrast_ratio || col == col_min)
+  261   5                          {
+  262   6                              left_edge_line[row] = col;
+  263   6      
+  264   6                              // 收缩搜索窗口到该列附近（±SEARCH_RANGE）
+  265   6                              left_start_col = (uint8)func_limit_ab(col + SEARCH_RANGE, col, col_max);
+  266   6                              left_end_col   = (uint8)func_limit_ab(col - SEARCH_RANGE, col_min, col);
+  267   6                              search_time = 0;
+  268   6                              break;
+  269   6                          }
+  270   5                      }
+  271   4                  } while (search_time);
+  272   3              }
+  273   2      
+  274   2              // ========== 右侧边线搜索 ==========
+  275   2              {
+  276   3                  search_time = 2;
+  277   3                  do
+  278   3                  {
+  279   4                      if (search_time == 1)
+  280   4                      {
+  281   5                          right_start_col = reference_col;
+  282   5                          right_end_col   = col_max;
+  283   5                      }
+  284   4                      search_time--;
+  285   4      
+  286   4                      // 从 start_col 向右侧扫描
+  287   4                      for (col = right_start_col; col <= right_end_col - PIXEL_OFFSET; col += PIXEL_OFFSET)
+  288   4                      {
+  289   5                          temp1 = *(p + col);                              // 当前像素
+  290   5                          temp2 = *(p + col + PIXEL_OFFSET);              // 右侧像素
+  291   5      
+  292   5                          // 起始列就是黑点 → 丢线标记
+  293   5                          if (temp1 < white_min_point && col == right_start_col && right_start_col == reference
+             -_col)
+  294   5                          {
+  295   6                              for (stop_point = row; stop_point > row_min; stop_point--)
+  296   6                                  right_edge_line[stop_point] = SEARCH_IMAGE_W - 1;
+  297   6                              lost_right = row;
+  298   6                              search_time = 0;
+  299   6                              break;
+  300   6                          }
+  301   5      
+  302   5                          // 当前像素是黑点 → 找到边线
+  303   5                          if (temp1 < white_min_point)
+  304   5                          {
+  305   6                              right_edge_line[row] = col;
+  306   6                              break;
+  307   6                          }
+  308   5      
+  309   5                          if (temp2 > white_max_point) continue;
+  310   5      
+  311   5                          // 和差比检测
+  312   5                          contrast = get_contrast(temp1, temp2);
+  313   5                          if (contrast > reference_contrast_ratio || col >= col_max - PIXEL_OFFSET)
+  314   5                          {
+  315   6                              right_edge_line[row] = col;
+  316   6      
+  317   6                              // 收缩搜索窗口
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 6   
+
+  318   6                              right_start_col = (uint8)func_limit_ab(col - SEARCH_RANGE, col_min, col);
+  319   6                              right_end_col   = (uint8)func_limit_ab(col + SEARCH_RANGE, col, col_max);
+  320   6                              search_time = 0;
+  321   6                              break;
+  322   6                          }
+  323   5                      }
+  324   4                  } while (search_time);
+  325   3              }
+  326   2          }
+  327   1      
+  328   1          // ---- 保存原始采样边线（插值前，供拐点检测用）----
+  329   1          memcpy(left_edge_raw,  left_edge_line,  sizeof(left_edge_line));
+  330   1          memcpy(right_edge_raw, right_edge_line, sizeof(right_edge_line));
+  331   1      
+  332   1          // 填充采样间隔之间的行（保持原始值的连续性）
+  333   1          {
+  334   2              uint8 r, j;
+  335   2              for (r = SEARCH_IMAGE_H - 1; r >= STOP_ROW + PIXEL_OFFSET; r -= PIXEL_OFFSET) {
+  336   3                  for (j = 1; j < PIXEL_OFFSET; j++) {
+  337   4                      left_edge_raw[r - j] = left_edge_raw[r];
+  338   4                      right_edge_raw[r - j] = right_edge_raw[r];
+  339   4                  }
+  340   3              }
+  341   2          }
+  342   1      
+  343   1          // ---- 圆环定向扫描：沿环岛方向重新搜索边线 ----
+  344   1          if (ring_scan_dir == 1)
+  345   1          {
+  346   2              // 左环扫描：从 upper_base_col 向右找亮→暗的跳变（赛道左边界）
+  347   2              for (row = row_max; row >= row_min; row--)
+  348   2              {
+  349   3                  p = image + row * SEARCH_IMAGE_W;
+  350   3                  for (col = upper_base_col; col < col_max; col++)
+  351   3                  {
+  352   4                      // 左边亮(赛道) + 右边暗(背景) = 边界
+  353   4                      if (*(p + col) > white_min_point && *(p + col + 1) <= white_min_point)
+  354   4                      {
+  355   5                          left_edge_line[row] = col;
+  356   5                          break;
+  357   5                      }
+  358   4                  }
+  359   3                  if (col >= col_max)   // 未找到 → 默认贴边
+  360   3                      left_edge_line[row] = 0;
+  361   3              }
+  362   2          }
+  363   1          else if (ring_scan_dir == 2)
+  364   1          {
+  365   2              // 右环扫描：从 upper_base_col 向左找亮→暗的跳变（赛道右边界）
+  366   2              for (row = row_max; row >= row_min; row--)
+  367   2              {
+  368   3                  p = image + row * SEARCH_IMAGE_W;
+  369   3                  for (col = upper_base_col; col > col_min; col--)
+  370   3                  {
+  371   4                      // 右边亮(赛道) + 左边暗(背景) = 边界
+  372   4                      if (*(p + col) > white_min_point && *(p + col - 1) <= white_min_point)
+  373   4                      {
+  374   5                          right_edge_line[row] = col;
+  375   5                          break;
+  376   5                      }
+  377   4                  }
+  378   3                  if (col == col_min)
+  379   3                      right_edge_line[row] = SEARCH_IMAGE_W - 1;
+  380   3              }
+  381   2          }
+  382   1      
+  383   1          // ---- 出口补偿：出口拐点以下保留原始控制线（不覆盖为补偿线）----
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 7   
+
+  384   1          if (ring_exit_compensate) {
+  385   2              if (ring_scan_dir == 1) {
+  386   3                  for (row = row_max; row >= row_min; row--) {
+  387   4                      if (row > exit_turn_row)           // 出口拐点以下
+  388   4                          left_edge_line[row] = left_control_line[row];   // 保留原始边线
+  389   4                  }
+  390   3              }
+  391   2              else if (ring_scan_dir == 2) {
+  392   3                  for (row = row_max; row >= row_min; row--) {
+  393   4                      if (row > exit_turn_row)
+  394   4                          right_edge_line[row] = right_control_line[row];
+  395   4                  }
+  396   3              }
+  397   2          }
+  398   1      
+  399   1          // ---- 后处理：插值填充 + 更新控制线 ----
+  400   1          insert_val();   // 线性插值填充采样间隔
+  401   1          memcpy(left_control_line,  left_edge_line,  sizeof(left_edge_line));
+  402   1          memcpy(right_control_line, right_edge_line, sizeof(right_edge_line));
+  403   1      }
+  404          
+  405          /**
+  406           * @brief  对边线采样行之间线性插值填充，使 PIXEL_OFFSET 间隔变为连续线
+  407           * @param  无
+  408           * @retval 无 (原地修改 left_edge_line[] / right_edge_line[])
+  409           * @note   从底部向上，对每两个采样行之间按等步长线性插值，
+  410           *         使得边线数组的每一行都有连续的列坐标
+  411           */
+  412          void insert_val(void)
+  413          {
+  414   1          uint8 i, j;
+  415   1          uint8 front_p, cur_p;
+  416   1          uint8 step;
+  417   1      
+  418   1          // ---- 左侧边线插值 ----
+  419   1          front_p = left_edge_line[SEARCH_IMAGE_H - 1];    // 最后一行(底部)作为起点
+  420   1          for (i = SEARCH_IMAGE_H - PIXEL_OFFSET - 1; i >= STOP_ROW; i -= PIXEL_OFFSET) {
+  421   2              cur_p = left_edge_line[i];                    // 上一采样行的列值
+  422   2      
+  423   2              if (cur_p >= front_p) {
+  424   3                  // 方向：向外(列增大) → 等步长递增
+  425   3                  step = (cur_p - front_p + PIXEL_OFFSET - 1) / PIXEL_OFFSET;
+  426   3                  for (j = 1; j < PIXEL_OFFSET; j++) {
+  427   4                      left_edge_line[i - j + PIXEL_OFFSET] = front_p + step * j;
+  428   4                  }
+  429   3              }
+  430   2              else {
+  431   3                  // 方向：向内(列减小) → 等步长递减
+  432   3                  step = (front_p - cur_p + PIXEL_OFFSET - 1) / PIXEL_OFFSET;
+  433   3                  for (j = 1; j < PIXEL_OFFSET; j++) {
+  434   4                      left_edge_line[i - j + PIXEL_OFFSET] = front_p - step * j;
+  435   4                  }
+  436   3              }
+  437   2              front_p = cur_p;   // 更新起点为当前采样行
+  438   2          }
+  439   1      
+  440   1          // ---- 右侧边线插值（逻辑同左侧）----
+  441   1          front_p = right_edge_line[SEARCH_IMAGE_H - 1];
+  442   1          for (i = SEARCH_IMAGE_H - PIXEL_OFFSET - 1; i >= STOP_ROW; i -= PIXEL_OFFSET) {
+  443   2              cur_p = right_edge_line[i];
+  444   2      
+  445   2              if (cur_p >= front_p) {
+  446   3                  step = (cur_p - front_p + PIXEL_OFFSET - 1) / PIXEL_OFFSET;
+  447   3                  for (j = 1; j < PIXEL_OFFSET; j++) {
+  448   4                      right_edge_line[i - j + PIXEL_OFFSET] = front_p + j * step;
+  449   4                  }
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 8   
+
+  450   3              }
+  451   2              else {
+  452   3                  step = (front_p - cur_p + PIXEL_OFFSET - 1) / PIXEL_OFFSET;
+  453   3                  for (j = 1; j < PIXEL_OFFSET; j++) {
+  454   4                      right_edge_line[i - j + PIXEL_OFFSET] = front_p - j * step;
+  455   4                  }
+  456   3              }
+  457   2              front_p = cur_p;
+  458   2          }
+  459   1      }
+  460          
+  461          /**
+  462           * @brief  由左右边线合成中线，支持圆环补线和出口补偿
+  463           * @param  无
+  464           * @retval 无 (更新 mid_line[])
+  465           * @note   正常模式: mid_line = (left + right) / 2
+  466           *         入环补线: 拐点以上用原始边线，拐点以下用补偿线替代丢线侧
+  467           *         出口补偿: 拐点以上用补偿线，拐点以下用原始控制线
+  468           */
+  469          void Fitted_Midline(void)
+  470          {
+  471   1          uint8 i;
+  472   1          uint8 comp_val;
+  473   1      
+  474   1          if (ring_exit_compensate) {
+  475   2              // 出口补偿模式：拐点以上用补偿线，拐点以下用原始线
+  476   2              if (ring_scan_dir == 1) {
+  477   3                  for (i = 0; i < SEARCH_IMAGE_H; i++) {
+  478   4                      comp_val = (i <= exit_turn_row) ? ring_comp_line[i] : left_control_line[i];
+  479   4                      mid_line[i] = (comp_val + right_control_line[i]) >> 1;   // 均值=中线
+  480   4                  }
+  481   3              } else {
+  482   3                  for (i = 0; i < SEARCH_IMAGE_H; i++) {
+  483   4                      comp_val = (i <= exit_turn_row) ? ring_comp_line[i] : right_control_line[i];
+  484   4                      mid_line[i] = (left_control_line[i] + comp_val) >> 1;
+  485   4                  }
+  486   3              }
+  487   2          } else if (ring_compensate) {
+  488   2              // 入环补线模式：拐点以下用补偿线替代丢线侧
+  489   2              if (ring_scan_dir == 1) {
+  490   3                  for (i = 0; i < SEARCH_IMAGE_H; i++) {
+  491   4                      comp_val = (i >= upper_turn_row) ? ring_comp_line[i] : left_control_line[i];
+  492   4                      mid_line[i] = (comp_val + right_control_line[i]) >> 1;
+  493   4                  }
+  494   3              } else {
+  495   3                  for (i = 0; i < SEARCH_IMAGE_H; i++) {
+  496   4                      comp_val = (i >= upper_turn_row) ? ring_comp_line[i] : right_control_line[i];
+  497   4                      mid_line[i] = (left_control_line[i] + comp_val) >> 1;
+  498   4                  }
+  499   3              }
+  500   2          } else {
+  501   2              // 正常模式：直接取双边均值
+  502   2              for (i = 0; i < SEARCH_IMAGE_H; i++)
+  503   2                  mid_line[i] = (left_control_line[i] + right_control_line[i]) >> 1;
+  504   2          }
+  505   1      }
+  506          
+  507          int32 err_sum = 0;             // 加权中线偏差和（供PID使用）
+  508          int32 err_far = 0, err_mid = 0, err_near = 0;   // 远/中/近三分区误差
+  509          uint8 valid_start_row = 80;    // 有效反馈起始行
+  510          uint8 valid_row_count = 26;    // 有效反馈行数
+  511          
+  512          static uint8 is_line_invalid(uint8 row);
+  513          
+  514          /**
+  515           * @brief  三分区加权偏差：远/中/近加权求和，自动跳过无效行
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 9   
+
+  516           * @param  无
+  517           * @retval 无 (更新 err_sum / valid_start_row / valid_row_count)
+  518           * @note   正常模式: 30/30/40 权重, 环岛模式: 25/30/45 权重
+  519           *         先扫描中线跳变确定有效起始行，再分三个区域加权平均
+  520           */
+  521          void Error_sum(void)
+  522          {
+  523   1          uint8 i;
+  524   1          int32 err1 = 0, err2 = 0, err3 = 0;
+  525   1          int32 cnt1 = 0, cnt2 = 0, cnt3 = 0;
+  526   1          uint8 first_valid, block_rows, p1_end, p2_end;
+  527   1      
+  528   1          // ========== 出口模式：从出口拐点往上取有效区域 ==========
+  529   1          if (ring_state == 4 && exit_turn_locked) {
+  530   2              uint8 zone_end = exit_turn_row + 8;
+  531   2              if (zone_end > 106) zone_end = 106;
+  532   2      
+  533   2              first_valid = 0;
+  534   2              valid_start_row = first_valid;
+  535   2              block_rows = zone_end - first_valid;
+  536   2      
+  537   2              // 40%/30%/30% 分区
+  538   2              p1_end = first_valid + block_rows * 40 / 100;
+  539   2              p2_end = first_valid + block_rows * 70 / 100;
+  540   2      
+  541   2              // 近区（底部40%）
+  542   2              for (i = first_valid; i < p1_end; i++) { err1 += mid_line[i]; cnt1++; }
+  543   2              // 中区（中间30%）
+  544   2              for (i = p1_end; i < p2_end; i++) { err2 += mid_line[i]; cnt2++; }
+  545   2              // 远区（顶部30%）
+  546   2              for (i = p2_end; i < zone_end; i++) { err3 += mid_line[i]; cnt3++; }
+  547   2      
+  548   2              // 各区域取均值
+  549   2              if (cnt1 > 0) err1 /= cnt1;
+  550   2              if (cnt2 > 0) err2 /= cnt2;
+  551   2              if (cnt3 > 0) err3 /= cnt3;
+  552   2      
+  553   2              // 加权融合：近区重视(45%) + 中区30% + 远区25%
+  554   2              err_sum = (err1 * 25 + err2 * 30 + err3 * 45) / 100;
+  555   2              valid_row_count = (uint8)(cnt1 + cnt2 + cnt3);
+  556   2              return;
+  557   2          }
+  558   1      
+  559   1          // ========== 入环补线模式：从上拐点开始取有效区域 ==========
+  560   1          if (ring_state == 2) {
+  561   2              first_valid = upper_turn_row;
+  562   2              if (first_valid < 6) first_valid = 6;
+  563   2              valid_start_row = first_valid;
+  564   2              block_rows = 106 - first_valid;
+  565   2      
+  566   2              p1_end = first_valid + block_rows * 40 / 100;
+  567   2              p2_end = first_valid + block_rows * 70 / 100;
+  568   2      
+  569   2              // 近中区跳过无效行（双边丢线+中心暗），远区全部计入
+  570   2              for (i = first_valid; i < p1_end; i++) {
+  571   3                  if (!is_line_invalid(i)) { err1 += mid_line[i]; cnt1++; }
+  572   3              }
+  573   2              for (i = p1_end; i < p2_end; i++) {
+  574   3                  if (!is_line_invalid(i)) { err2 += mid_line[i]; cnt2++; }
+  575   3              }
+  576   2              for (i = p2_end; i < 106; i++) { err3 += mid_line[i]; cnt3++; }
+  577   2      
+  578   2              if (cnt1 > 0) err1 /= cnt1;
+  579   2              if (cnt2 > 0) err2 /= cnt2;
+  580   2              if (cnt3 > 0) err3 /= cnt3;
+  581   2      
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 10  
+
+  582   2              err_sum = (err1 * 25 + err2 * 30 + err3 * 45) / 100;
+  583   2              valid_row_count = (uint8)(cnt1 + cnt2 + cnt3);
+  584   2              return;
+  585   2          }
+  586   1      
+  587   1          // ========== 正常模式：扫描中线跳变确定有效起始行 ==========
+  588   1          first_valid = 0;
+  589   1          i = 79;
+  590   1          do {
+  591   2              // 无效行条件：双边丢线+中心暗 或 中线跳变>40
+  592   2              if (is_line_invalid(i)) {
+  593   3                  first_valid = i + 1;   // 从下一行开始有效
+  594   3                  break;
+  595   3              }
+  596   2              if (i + 4 < 106) {
+  597   3                  int16 jump = (int16)mid_line[i] - (int16)mid_line[i + 4];
+  598   3                  if (jump < -40 || jump > 40) {   // 4行内跳变>40 → 此行为噪点
+  599   4                      first_valid = i + 1;
+  600   4                      break;
+  601   4                  }
+  602   3              }
+  603   2          } while (i-- > 0);
+  604   1      
+  605   1          valid_start_row = first_valid;
+  606   1          block_rows = 106 - first_valid;
+  607   1      
+  608   1          // 40%/30%/30% 分区
+  609   1          p1_end = first_valid + block_rows * 40 / 100;
+  610   1          p2_end = first_valid + block_rows * 70 / 100;
+  611   1      
+  612   1          // 近区（底部40%）
+  613   1          for (i = first_valid; i < p1_end; i++) {
+  614   2              if (!is_line_invalid(i)) { err1 += mid_line[i]; cnt1++; }
+  615   2          }
+  616   1          // 中区（中间30%）
+  617   1          for (i = p1_end; i < p2_end; i++) {
+  618   2              if (!is_line_invalid(i)) { err2 += mid_line[i]; cnt2++; }
+  619   2          }
+  620   1          // 远区（顶部30%，全部计入）
+  621   1          for (i = p2_end; i < 106; i++) { err3 += mid_line[i]; cnt3++; }
+  622   1      
+  623   1          // 各区域取均值
+  624   1          if (cnt1 > 0) err1 /= cnt1;
+  625   1          if (cnt2 > 0) err2 /= cnt2;
+  626   1          if (cnt3 > 0) err3 /= cnt3;
+  627   1      
+  628   1          // 加权融合：近区30% + 中区30% + 远区40%（正常模式远区权重较高）
+  629   1          err_sum = (err1 * 30 + err2 * 30 + err3 * 40) / 100;
+  630   1      
+  631   1          valid_row_count = (uint8)(cnt1 + cnt2 + cnt3);
+  632   1      }
+  633          
+  634          /**
+  635           * @brief  丢线外推：根据最后有效行斜率预测丢线区域边线位置
+  636           * @param  无
+  637           * @retval 无 (修改 left_control_line[] / right_control_line[])
+  638           * @note   从丢线行开始向上，用底部的边线斜率线性外推，保持边线方向连续性
+  639           */
+  640          void Extend_Lost_Line(void)
+  641          {
+  642   1          uint8 row;
+  643   1          int16 predicted;
+  644   1          float slope;
+  645   1      
+  646   1          // ---- 左侧丢线外推 ----
+  647   1          if (lost_left != STOP_ROW)
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 11  
+
+  648   1          {
+  649   2              // 找到丢线行下方第一个有效行作为基准行
+  650   2              uint8 base_row = lost_left;
+  651   2              while (base_row < SEARCH_IMAGE_H - 1)
+  652   2              {
+  653   3                  base_row++;
+  654   3                  if (left_edge_line[base_row] > 0 && left_edge_line[base_row] < SEARCH_IMAGE_W - 1)
+  655   3                      break;
+  656   3              }
+  657   2      
+  658   2              if (base_row < SEARCH_IMAGE_H - 1)
+  659   2              {
+  660   3                  // 计算斜率 = (基准行 - 上一采样行) / PIXEL_OFFSET
+  661   3                  int16 d_col = (int16)left_edge_line[base_row] - (int16)left_edge_line[base_row - PIXEL_OFFSET
+             -];
+  662   3                  slope = (float)d_col / PIXEL_OFFSET;
+  663   3      
+  664   3                  // 从丢线行向上按斜率外推
+  665   3                  for (row = lost_left; row >= STOP_ROW; row--)
+  666   3                  {
+  667   4                      predicted = (int16)left_edge_line[base_row] + (int16)(slope * (row - base_row));
+  668   4                      if (predicted < 0) predicted = 0;
+  669   4                      if (predicted > SEARCH_IMAGE_W - 1) predicted = SEARCH_IMAGE_W - 1;
+  670   4                      left_control_line[row] = (uint8)predicted;
+  671   4                  }
+  672   3              }
+  673   2          }
+  674   1      
+  675   1          // ---- 右侧丢线外推（逻辑同左侧）----
+  676   1          if (lost_right != STOP_ROW)
+  677   1          {
+  678   2              uint8 base_row = lost_right;
+  679   2              while (base_row < SEARCH_IMAGE_H - 1)
+  680   2              {
+  681   3                  base_row++;
+  682   3                  if (right_edge_line[base_row] > 0 && right_edge_line[base_row] < SEARCH_IMAGE_W - 1)
+  683   3                      break;
+  684   3              }
+  685   2      
+  686   2              if (base_row < SEARCH_IMAGE_H - 1)
+  687   2              {
+  688   3                  int16 d_col = (int16)right_edge_line[base_row] - (int16)right_edge_line[base_row - PIXEL_OFFS
+             -ET];
+  689   3                  slope = (float)d_col / PIXEL_OFFSET;
+  690   3      
+  691   3                  for (row = lost_right; row >= STOP_ROW; row--)
+  692   3                  {
+  693   4                      predicted = (int16)right_edge_line[base_row] + (int16)(slope * (row - base_row));
+  694   4                      if (predicted < 0) predicted = 0;
+  695   4                      if (predicted > SEARCH_IMAGE_W - 1) predicted = SEARCH_IMAGE_W - 1;
+  696   4                      right_control_line[row] = (uint8)predicted;
+  697   4                  }
+  698   3              }
+  699   2          }
+  700   1      }
+  701          
+  702          /**
+  703           * @brief  判断某行中线是否无效（双边丢线且中心点偏黑<50）
+  704           * @param  row  行号
+  705           * @retval 1=无效, 0=有效
+  706           */
+  707          static uint8 is_line_invalid(uint8 row)
+  708          {
+  709   1          // 双边都贴边（完全丢线）
+  710   1          if (left_control_line[row] <= 5 && right_control_line[row] >= SEARCH_IMAGE_W - 5)
+  711   1          {
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 12  
+
+  712   2              // 且中心点灰度<50（极暗，说明不是赛道）
+  713   2              if (mt9v03x_image[row][mid_line[row]] < 50)
+  714   2                  return 1;
+  715   2          }
+  716   1          return 0;
+  717   1      }
+  718          
+  719          /**
+  720           * @brief  前馈误差重置（每帧开始时清零，由 Error_sum 后的 Error_feedforward 重新计�
+             -��）
+  721           * @param  无
+  722           * @retval 无
+  723           */
+  724          void Error_feedforward(void)
+  725          {
+  726   1          ff_confidence = 0.0f;
+  727   1          err_feedforward = 0;
+  728   1          ff_cancelled = 0;
+  729   1      }
+  730          
+  731          /**
+  732           * @brief  斑马线检测：50-57行区域扫描短黑段(2~7像素)≥4个即判定
+  733           * @param  无
+  734           * @retval 无 (设置 crosswalk_detected / crosswalk_stop_flag)
+  735           * @note   斑马线特征：赛道内出现多个短而离散的黑色条纹(2-7像素宽)
+  736           */
+  737          void Detect_Crosswalk(void)
+  738          {
+  739   1          uint8 row, col;
+  740   1          uint8 black_len, short_black_cnt;
+  741   1          uint8 l_edge, r_edge, width;
+  742   1      
+  743   1          crosswalk_detected = 0;
+  744   1      
+  745   1          // 扫描50-57行（斑马线通常在这个高度区域）
+  746   1          for (row = 50; row <= 57; row++)
+  747   1          {
+  748   2              l_edge = left_control_line[row];
+  749   2              r_edge = right_control_line[row];
+  750   2              if (l_edge >= r_edge) continue;           // 无效行
+  751   2      
+  752   2              width = r_edge - l_edge;
+  753   2              if (width < 25) continue;                  // 赛道太窄，不可靠
+  754   2      
+  755   2              black_len = 0;
+  756   2              short_black_cnt = 0;
+  757   2      
+  758   2              // 从左到右扫描该行赛道内的黑色段
+  759   2              for (col = l_edge; col <= r_edge; col++)
+  760   2              {
+  761   3                  if (mt9v03x_image[row][col] < white_min_point)
+  762   3                  {
+  763   4                      black_len++;                       // 持续暗像素
+  764   4                  }
+  765   3                  else
+  766   3                  {
+  767   4                      // 遇到亮像素：检查上一个暗段的长度
+  768   4                      if (black_len >= 2 && black_len <= 7)
+  769   4                      {
+  770   5                          short_black_cnt++;              // 短黑段计数+1
+  771   5                      }
+  772   4                      black_len = 0;                      // 重置段长度
+  773   4                  }
+  774   3              }
+  775   2      
+  776   2              // 一行内≥4个短黑段 → 判定为斑马线
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 13  
+
+  777   2              if (short_black_cnt >= 4)
+  778   2              {
+  779   3                  crosswalk_detected = 1;
+  780   3                  crosswalk_stop_flag = 1;               // 触发停车标志
+  781   3                  return;
+  782   3              }
+  783   2          }
+  784   1      }
+  785          
+  786          /**
+  787           * @brief  十字路口检测：30-90行双边丢线≥15行 + 近场有单边线，连续2帧确认
+  788           * @param  无
+  789           * @retval 无 (设置 crossroad_detected / cross_state)
+  790           * @note   十字特征：中上部大范围双边丢线（十字交叉区），但底部仍有单侧边�
+             -��
+  791           */
+  792          void Detect_Crossroad(void)
+  793          {
+  794   1          uint8 row;
+  795   1          uint8 bilateral_lost = 0;     // 双边丢线计数
+  796   1          uint8 near_ok = 0;            // 近场有效标志
+  797   1      
+  798   1          crossroad_detected = 0;
+  799   1      
+  800   1          // ---- 1. 检查近场（100-119行）是否有单边线 ----
+  801   1          for (row = 100; row <= 119; row++)
+  802   1          {
+  803   2              if (left_control_line[row] > 10 || right_control_line[row] < SEARCH_IMAGE_W - 10)
+  804   2              {
+  805   3                  near_ok = 1;   // 至少有一侧边线在赛道内
+  806   3                  break;
+  807   3              }
+  808   2          }
+  809   1          if (!near_ok) { cross_confirm_cnt = 0; return; }   // 近场全丢 → 非十字
+  810   1      
+  811   1          // ---- 2. 统计30-90行双边丢线行数 ----
+  812   1          for (row = 30; row <= 90; row++)
+  813   1          {
+  814   2              if (left_control_line[row] <= 5 && right_control_line[row] >= SEARCH_IMAGE_W - 5)
+  815   2              {
+  816   3                  bilateral_lost++;
+  817   3              }
+  818   2          }
+  819   1      
+  820   1          // ---- 3. 双边丢线≥15行 → 十字路口候选 ----
+  821   1          if (bilateral_lost >= 15)
+  822   1          {
+  823   2              cross_confirm_cnt++;
+  824   2              if (cross_confirm_cnt >= 2)          // 连续2帧确认（防抖动）
+  825   2              {
+  826   3                  crossroad_detected = 1;
+  827   3                  cross_state = 1;
+  828   3                  cross_confirm_cnt = 0;
+  829   3              }
+  830   2          }
+  831   1          else
+  832   1          {
+  833   2              if (cross_confirm_cnt > 0) cross_confirm_cnt--;   // 不满足条件则衰减计数
+  834   2          }
+  835   1      }
+
+
+Module Information          Static   Overlayable
+------------------------------------------------
+  code size            =      5193     ------
+  ecode size           =    ------     ------
+  data size            =    ------     ------
+C251 COMPILER V5.60.0,  image                                                              21/09/26  22:45:15  PAGE 14  
+
+  idata size           =    ------     ------
+  pdata size           =    ------     ------
+  xdata size           =      1019         51
+  xdata-const size     =    ------     ------
+  edata size           =    ------     ------
+  bit size             =    ------     ------
+  ebit size            =    ------     ------
+  bitaddressable size  =    ------     ------
+  ebitaddressable size =    ------     ------
+  far data size        =     22560     ------
+  huge data size       =    ------     ------
+  const size           =    ------     ------
+  hconst size          =       153     ------
+End of Module Information.
+
+
+C251 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

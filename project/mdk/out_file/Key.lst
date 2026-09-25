@@ -1,0 +1,117 @@
+C251 COMPILER V5.60.0,  Key                                                                14/06/26  22:56:46  PAGE 1   
+
+
+C251 COMPILER V5.60.0, COMPILATION OF MODULE Key
+OBJECT MODULE PLACED IN .\out_file\Key.obj
+COMPILER INVOKED BY: D:\Keil C251\Keil C251\C251\BIN\C251.EXE ..\code\Key.c LARGE ROM(HUGE) WARNINGLEVEL(3) OPTIMIZE(0,S
+                    -IZE) BROWSE INCDIR(..\..\libraries\zf_common;..\..\libraries\zf_components;..\..\libraries\zf_device;..\..\libraries\zf_
+                    -driver;..\user;..\code;..\..\libraries\zf_components\stc32g_usb_lib;..\..\libraries\zf_components\seekfree_assistant) DE
+                    -BUG PRINT(.\out_file\Key.lst) OBJECT(.\out_file\Key.obj) 
+
+stmt  level    source
+
+    1          /**
+    2           * @file    Key.c
+    3           * @brief   按键检测模块：4个按键的状态读取和松开标志位生成
+    4           * @author  RRZ
+    5           * @date    2026-05-16
+    6           */
+    7          
+    8          #include "Key.h"
+    9          
+   10          // 按键状态变量
+   11          uint8 key1_status = 1;
+   12          uint8 key2_status = 1;
+   13          uint8 key3_status = 1;
+   14          uint8 key4_status = 1;
+   15          
+   16          // 上一次按键状态变量
+   17          uint8 key1_last_status;
+   18          uint8 key2_last_status;
+   19          uint8 key3_last_status;
+   20          uint8 key4_last_status;
+   21          
+   22          // 按键标志位
+   23          uint8 key1_flag;
+   24          uint8 key2_flag;
+   25          uint8 key3_flag;
+   26          uint8 key4_flag;
+   27          
+   28          /**
+   29           * @brief  读取按键状态并产生松开标志位
+   30           * @param  无
+   31           * @retval 无 (更新 keyX_flag)
+   32           * @note   按键松开(上升沿)时对应 flag 置1，调用后需手动清零 flag
+   33           */
+   34          void Key_GetNum(void)
+   35          {
+   36   1          key1_last_status = key1_status;
+   37   1          key2_last_status = key2_status;
+   38   1          key3_last_status = key3_status;
+   39   1          key4_last_status = key4_status;
+   40   1      
+   41   1          // 获取当前按键状态
+   42   1          key1_status = gpio_get_level(KEY1_PIN);
+   43   1          key2_status = gpio_get_level(KEY2_PIN);
+   44   1          key3_status = gpio_get_level(KEY3_PIN);
+   45   1          key4_status = gpio_get_level(KEY4_PIN);
+   46   1      
+   47   1          //检测到松开按键之后  才打开按键标志位
+   48   1          if(key1_status && !key1_last_status)    key1_flag = 1;
+   49   1          if(key2_status && !key2_last_status)    key2_flag = 1;
+   50   1          if(key3_status && !key3_last_status)    key3_flag = 1;
+   51   1          if(key4_status && !key4_last_status)    key4_flag = 1;
+   52   1      }
+   53          
+   54          /**
+   55           * @brief  按键分析处理：读取按键并清零标志位
+   56           * @param  无
+C251 COMPILER V5.60.0,  Key                                                                14/06/26  22:56:46  PAGE 2   
+
+   57           * @retval 无
+   58           * @note   需在外部根据 flag 做具体处理后再调此函数清零
+   59           */
+   60          void Key_Anlysis(void)
+   61          {
+   62   1          Key_GetNum();
+   63   1          if(key1_flag)
+   64   1          {
+   65   2              key1_flag=0;
+   66   2          }
+   67   1          if(key2_flag)
+   68   1          {
+   69   2              key2_flag=0;
+   70   2          }
+   71   1          if(key3_flag)
+   72   1          {
+   73   2              key3_flag=0;
+   74   2          }
+   75   1          if(key4_flag)
+   76   1          {
+   77   2              key4_flag=0;
+   78   2          }
+   79   1      }
+
+
+Module Information          Static   Overlayable
+------------------------------------------------
+  code size            =    ------     ------
+  ecode size           =       238     ------
+  data size            =    ------     ------
+  idata size           =    ------     ------
+  pdata size           =    ------     ------
+  xdata size           =        12     ------
+  xdata-const size     =    ------     ------
+  edata size           =    ------     ------
+  bit size             =    ------     ------
+  ebit size            =    ------     ------
+  bitaddressable size  =    ------     ------
+  ebitaddressable size =    ------     ------
+  far data size        =    ------     ------
+  huge data size       =    ------     ------
+  const size           =    ------     ------
+  hconst size          =        24     ------
+End of Module Information.
+
+
+C251 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)

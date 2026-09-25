@@ -1,0 +1,163 @@
+C251 COMPILER V5.60.0,  main                                                               14/06/26  22:56:49  PAGE 1   
+
+
+C251 COMPILER V5.60.0, COMPILATION OF MODULE main
+OBJECT MODULE PLACED IN .\out_file\main.obj
+COMPILER INVOKED BY: D:\Keil C251\Keil C251\C251\BIN\C251.EXE ..\user\main.c LARGE ROM(HUGE) WARNINGLEVEL(3) OPTIMIZE(0,
+                    -SIZE) BROWSE INCDIR(..\..\libraries\zf_common;..\..\libraries\zf_components;..\..\libraries\zf_device;..\..\libraries\zf
+                    -_driver;..\user;..\code;..\..\libraries\zf_components\stc32g_usb_lib;..\..\libraries\zf_components\seekfree_assistant) D
+                    -EBUG PRINT(.\out_file\main.lst) OBJECT(.\out_file\main.obj) 
+
+stmt  level    source
+
+    1          /**
+    2           * @file    main.c
+    3           * @brief   调参愉快！
+    4           * @author  RRZ
+    5           * @date    2026-06-10
+    6           */
+    7          
+    8          #include "zf_common_headfile.h"
+    9          #include "Wifi_Config.h"
+   10          #include "Vofa_Send.h"
+   11          #include "tft180.h"
+   12          #include "Key.h"
+   13          
+   14          uint8 ControlFlag = 0;     // 运行启停标志，0=停止 1=运行(按键4或VOFA "start"切换)
+   15          uint32 time = 0;           // 5ms计时器，系统运行时间(ms)
+   16          uint8 keynum = 0;
+   17          extern uint8 laser_flow_enable;
+   18          extern float g_ring_speed_factor;
+   19          extern float g_ring_diff_kp;
+   20          extern volatile PID_tf servo_pidf;
+   21          extern float diff_kp;
+   22          extern float g_ff_scale;
+   23          
+   24          void main(void)
+   25          {
+   26   1          System_Init ();
+   27   1          laser_init();
+   28   1          laser_off();   // 初始全部关断
+   29   1      //      Ring_Debug_Init();
+   30   1      #ifdef USE_WIFI_VOFA
+   31   1          vofa_send_init();
+   32   1      #endif
+   33   1      
+   34   1          while (1)
+   35   1          {
+   36   2              if (mt9v03x_finish_flag)
+   37   2              {
+   38   3                  // ----- 视觉处理 -----
+   39   3                  get_reference_point(mt9v03x_image[0]);
+   40   3                  Search_reference_col(mt9v03x_image[0]);
+   41   3                  Search_line(mt9v03x_image[0]);
+   42   3                  Extend_Lost_Line();
+   43   3                  Ring();
+   44   3                  Fitted_Midline();
+   45   3                  Error_sum();
+   46   3                  Error_feedforward();
+   47   3      //            Detect_Crosswalk();    // 斑马线检测（已注释，如需启用取消注释）
+   48   3                              Negative_Pressure(g_fan_speed);
+   49   3                  if (ring_state == 0) {
+   50   4                      Detect_Crossroad();
+   51   4                  }
+   52   3                  if (g_ff_scale > 5.0f) Aim_Process_MainLoop();   // 前馈缩放（g_ff_scale）>5时启动�
+             -�靶，前馈已经禁用，此变量仅作为打靶启动标志位
+   53   3      
+   54   3      //            Key_GetNum();
+   55   3      //            if (key1_flag) { g_base_speed = 100; g_fan_speed = 0; keynum = 1; key1_flag = 0; }   // 按
+C251 COMPILER V5.60.0,  main                                                               14/06/26  22:56:49  PAGE 2   
+
+             -键1: 低速100，负压关
+   56   3      //            if (key2_flag) { g_base_speed = 120; g_fan_speed = 0; keynum = 2; key2_flag = 0; }   // 按
+             -键2: 中速120，负压关
+   57   3      //            if (key3_flag) { g_base_speed = 130; g_fan_speed = 60; keynum = 3; key3_flag = 0; }  // 按
+             -键3: 高速130，负压60%
+   58   3      //            if (key4_flag) {
+   59   3      //                if (ControlFlag) {
+   60   3      //                    ControlFlag = 0;
+   61   3      //                    Ring_Init();
+   62   3      //                    Motor_Stop();
+   63   3      //                    keynum = 0;
+   64   3      //                } else {
+   65   3      //                    ControlFlag = 1;
+   66   3      //                    keynum = 4;
+   67   3      //                }
+   68   3      //                key4_flag = 0;
+   69   3      //            }
+   70   3      
+   71   3      #ifdef USE_TFT
+                           TFT_Display();
+               #endif
+   74   3      #ifdef USE_WIFI_VOFA
+   75   3                  vofa_send_data();
+   76   3      #endif
+   77   3                  mt9v03x_finish_flag = 0;
+   78   3              }
+   79   2      
+   80   2      #ifdef USE_WIFI_VOFA
+   81   2              vofa_check_receive();
+   82   2      #endif
+   83   2      
+   84   2      //        Laser_Flow_Process();
+   85   2      //        laser_on();   // 9路全亮
+   86   2          }
+   87   1      }
+   88          
+   89          /**
+   90           * @brief  5ms定时中断处理函数
+   91           * @param  无
+   92           * @retval 无
+   93           * @note   每5ms执行: 陀螺仪读取→陀螺仪积分→编码器读取→打靶中断处理→
+   94           *         启停检测(ControlFlag下降沿触发急停)→电机控制→舵机控制→计时器累加
+   95           */
+   96          void pit_handler(void)
+   97          {
+   98   1          static uint8 last_ControlFlag = 0;
+   99   1      
+  100   1          imu660ra_get_gyro();
+  101   1              Gyro_Integrate();
+  102   1          Encoder_GetValue();
+  103   1      
+  104   1          Aim_Process_Interrupt();
+  105   1      
+  106   1          if (last_ControlFlag == 1 && ControlFlag == 0)
+  107   1          {
+  108   2              Motor_Stop();
+  109   2          }
+  110   1          last_ControlFlag = ControlFlag;
+  111   1      
+  112   1          if (ControlFlag)
+  113   1          {
+  114   2              Motor_Loop();
+  115   2          }
+  116   1      
+  117   1          Servo_Loop();
+  118   1          time++;
+C251 COMPILER V5.60.0,  main                                                               14/06/26  22:56:49  PAGE 3   
+
+  119   1      }
+
+
+Module Information          Static   Overlayable
+------------------------------------------------
+  code size            =    ------     ------
+  ecode size           =       282     ------
+  data size            =    ------     ------
+  idata size           =    ------     ------
+  pdata size           =    ------     ------
+  xdata size           =         7     ------
+  xdata-const size     =    ------     ------
+  edata size           =    ------     ------
+  bit size             =    ------     ------
+  ebit size            =    ------     ------
+  bitaddressable size  =    ------     ------
+  ebitaddressable size =    ------     ------
+  far data size        =    ------     ------
+  huge data size       =    ------     ------
+  const size           =    ------     ------
+  hconst size          =        29     ------
+End of Module Information.
+
+
+C251 COMPILATION COMPLETE.  0 WARNING(S),  0 ERROR(S)
