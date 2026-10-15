@@ -1,0 +1,28 @@
+# ===== Keil C251 编译产物（不纳入版本控制） =====
+
+# 目标文件 / 列表 / 交叉引用
+project/mdk/*.obj
+project/mdk/*.OBJ
+project/mdk/*.lst
+project/mdk/*.LST
+project/mdk/*.crf
+project/mdk/*.CRF
+project/mdk/*.__i
+
+# 链接 / 烧录产物
+project/mdk/*.hex
+project/mdk/*.HEX
+project/mdk/*.MAP
+project/mdk/*.map
+project/mdk/*.lnp
+project/mdk/*.build_log.htm
+project/mdk/seekfree
+
+# UV4 界面状态（按用户/机器不同）
+project/mdk/*.uvgui*
+
+# 旧编译参照目录（out_file，仅本地保留）
+project/mdk/out_file/
+
+# 命令行编译日志
+project/mdk/cli_build_log.txt

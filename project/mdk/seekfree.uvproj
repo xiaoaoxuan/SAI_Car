@@ -49,7 +49,7 @@
           <OutputName>seekfree</OutputName>
           <CreateExecutable>1</CreateExecutable>
           <CreateLib>0</CreateLib>
-          <CreateHexFile>0</CreateHexFile>
+          <CreateHexFile>1</CreateHexFile>
           <DebugInformation>1</DebugInformation>
           <BrowseInformation>1</BrowseInformation>
           <ListingPath>.\</ListingPath>
@@ -118,9 +118,9 @@
         </DllOption>
         <DebugOption>
           <OPTHX>
-            <HexSelection>0</HexSelection>
-            <HexRangeLowAddress>0</HexRangeLowAddress>
-            <HexRangeHighAddress>0</HexRangeHighAddress>
+            <HexSelection>1</HexSelection>
+            <HexRangeLowAddress>16521216</HexRangeLowAddress>
+            <HexRangeHighAddress>16777215</HexRangeHighAddress>
             <HexOffset>0</HexOffset>
             <Oh166RecLen>16</Oh166RecLen>
           </OPTHX>
@@ -188,7 +188,7 @@
           <Target251Misc>
             <MemoryModel>4</MemoryModel>
             <RTOS>0</RTOS>
-            <RomSize>3</RomSize>
+            <RomSize>4</RomSize>
             <NearDataHold>0</NearDataHold>
             <XDataHold>0</XDataHold>
             <FarDataHold>0</FarDataHold>
@@ -295,7 +295,7 @@
             <WarningLevel>2</WarningLevel>
             <DataOverlaying>1</DataOverlaying>
             <OverlayString></OverlayString>
-            <MiscControls></MiscControls>
+            <MiscControls>DISABLEWARNING(57,16,7,25) REMOVEUNUSED,NOOVERLAY CLASSES(EDATA(0x0-0x3FFF), HDATA(0x0-0x3FFF, 0x10000-0x2FFFF), HCONST(0xFC2800-0xFFFFFF), ECODE(0xFC2800-0xFFFFFF), XDATA(0x10000-0x1FFFF))</MiscControls>
             <DisableWarningNumbers></DisableWarningNumbers>
             <LinkerCmdFile></LinkerCmdFile>
             <Assign></Assign>

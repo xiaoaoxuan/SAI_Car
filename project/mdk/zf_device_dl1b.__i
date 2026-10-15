@@ -1,1 +1,0 @@
-"..\..\libraries\zf_device\zf_device_dl1b.c" LARGE INTR2 BROWSE INCDIR(..\..\libraries\zf_common;..\..\libraries\zf_device;..\..\libraries\zf_driver;..\code;..\mdk;..\user;..\..\libraries\zf_components\seekfree_assistant;..\..\libraries\zf_components\stc32g_usb_lib) DEBUG PRINT(.\zf_device_dl1b.lst) OBJECT(.\zf_device_dl1b.obj)
